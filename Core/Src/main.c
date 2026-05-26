@@ -72,6 +72,8 @@
 #define AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG 4500U
 #define AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG 31500U
 #define AUTO_MAPPING_DIAGONAL_SECTOR_CDEG 1800U
+#define AUTO_MAPPING_FRONT_BODY_OFFSET_MM 200U
+#define AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
 #define AUTO_MAPPING_MIN_SAFE_MM    350U
 #define AUTO_MAPPING_MAX_SAFE_MM    3000U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
@@ -347,6 +349,7 @@ static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
 static uint16_t GetObstacleSafeDistanceMm(void);
 static uint16_t GetAutoFrontBlockDistanceMm(void);
+static uint16_t TestApp_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 
 static bool OLED_InitMinimal(void);
 static bool OLED_WriteCommand(uint8_t command);
@@ -1363,6 +1366,7 @@ static void TestApp_SendLidarDebugPoint(const LidarPoint_t *point)
 static void TestApp_UpdateLidarFrontStats(const LidarPoint_t *point)
 {
   uint16_t robot_angle_cdeg;
+  uint16_t clearance_mm;
 
   if (point == NULL)
   {
@@ -1384,14 +1388,15 @@ static void TestApp_UpdateLidarFrontStats(const LidarPoint_t *point)
   {
     return;
   }
+  clearance_mm = TestApp_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
 
   lidar_front_current.point_count++;
   lidar_front_current.last_tick_ms = HAL_GetTick();
   if ((lidar_front_current.min_distance_mm == 0U) ||
-      (point->distance_mm < lidar_front_current.min_distance_mm))
+      (clearance_mm < lidar_front_current.min_distance_mm))
   {
     lidar_front_current.min_tick_ms = lidar_front_current.last_tick_ms;
-    lidar_front_current.min_distance_mm = point->distance_mm;
+    lidar_front_current.min_distance_mm = clearance_mm;
     lidar_front_current.min_raw_angle_cdeg = point->angle_cdeg;
     lidar_front_current.min_robot_angle_cdeg = robot_angle_cdeg;
     lidar_front_current.min_quality = point->quality;
@@ -1440,7 +1445,7 @@ static void TestApp_SendLidarFrontState(void)
   (void)snprintf(
       line,
       sizeof(line),
-      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u block=%u sector=%u blocked=%u auto=%u\r\n",
+      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u block=%u sector=%u body=%u blocked=%u auto=%u\r\n",
       (unsigned long)stats.scan_seq,
       (unsigned int)stats.point_count,
       (unsigned int)stats.min_distance_mm,
@@ -1451,6 +1456,7 @@ static void TestApp_SendLidarFrontState(void)
       (unsigned int)safe_mm,
       (unsigned int)block_mm,
       (unsigned int)AUTO_MAPPING_FRONT_SECTOR_CDEG,
+      (unsigned int)AUTO_MAPPING_FRONT_BODY_OFFSET_MM,
       (unsigned int)direct_blocked,
       (unsigned int)auto_blocked);
   (void)BluetoothControl_SendText(line);
@@ -2097,9 +2103,37 @@ static bool TestApp_IsLidarAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, 
   return AppAbs32(diff) <= (int32_t)half_width_cdeg;
 }
 
+static uint16_t TestApp_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm)
+{
+  uint16_t offset_mm = 0U;
+
+  if (distance_mm == 0U)
+  {
+    return 0U;
+  }
+
+  if (TestApp_IsFrontLidarPoint(robot_angle_cdeg))
+  {
+    offset_mm = AUTO_MAPPING_FRONT_BODY_OFFSET_MM;
+  }
+  else if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) ||
+           TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG))
+  {
+    offset_mm = AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM;
+  }
+
+  if (offset_mm == 0U)
+  {
+    return distance_mm;
+  }
+
+  return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 1U;
+}
+
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
 {
   uint16_t robot_angle_cdeg;
+  uint16_t clearance_mm;
 
   if ((point == NULL) || !auto_mapping_active)
   {
@@ -2113,6 +2147,7 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
   }
 
   robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
+  clearance_mm = TestApp_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
 
   if (((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U) &&
       (auto_mapping_observe_scan_starts_remaining > 0U))
@@ -2128,14 +2163,14 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
   }
 
   if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
-      (point->distance_mm < auto_mapping_front_min_mm))
+      (clearance_mm < auto_mapping_front_min_mm))
   {
-    auto_mapping_front_min_mm = point->distance_mm;
+    auto_mapping_front_min_mm = clearance_mm;
     auto_mapping_front_blocking_angle_cdeg = robot_angle_cdeg;
   }
 
   if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
-      (point->distance_mm <= GetAutoFrontBlockDistanceMm()))
+      (clearance_mm <= GetAutoFrontBlockDistanceMm()))
   {
     auto_mapping_front_blocked_until_ms = HAL_GetTick() + AUTO_MAPPING_FRONT_BLOCK_HOLD_MS;
     if (!angle_turn_active)
@@ -2151,9 +2186,9 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) &&
-      (point->distance_mm < auto_mapping_front_right_min_mm))
+      (clearance_mm < auto_mapping_front_right_min_mm))
   {
-    auto_mapping_front_right_min_mm = point->distance_mm;
+    auto_mapping_front_right_min_mm = clearance_mm;
   }
 
   if ((TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||

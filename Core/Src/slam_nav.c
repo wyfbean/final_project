@@ -35,6 +35,8 @@
 #define SLAM_NAV_LEFT_CENTER_CDEG       27000U
 #define SLAM_NAV_FRONT_RIGHT_CENTER_CDEG 4500U
 #define SLAM_NAV_FRONT_LEFT_CENTER_CDEG 31500U
+#define SLAM_NAV_FRONT_BODY_OFFSET_MM  200U
+#define SLAM_NAV_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
 #define SLAM_NAV_FRONT_BLOCK_HOLD_MS    600U
 #define SLAM_NAV_FRONT_BLOCK_CONFIRM_MS 450U
 #define SLAM_NAV_TURN_TOL_CDEG          1200L
@@ -151,6 +153,7 @@ static void SlamNav_UpdateSectorMin(uint16_t *value, uint16_t distance_mm);
 static void SlamNav_UpdateSectorStats(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 static SlamNavSectorStats_t SlamNav_GetSectorSnapshot(uint32_t now);
 static bool SlamNav_IsSectorOpen(uint16_t distance_mm, uint16_t local_block_mm);
+static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 static void SlamNav_BuildHeadingBias(const MappingGridPose_t *pose,
                                      bool prefer_goal,
                                      int32_t goal_x_mm,
@@ -289,6 +292,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   uint16_t safe_mm;
   uint16_t local_block_mm;
   uint16_t robot_angle_cdeg;
+  uint16_t clearance_mm;
 
   if ((point == NULL) ||
       !s_active ||
@@ -299,6 +303,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   }
 
   robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
+  clearance_mm = SlamNav_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
   if ((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U)
   {
     taskENTER_CRITICAL();
@@ -309,7 +314,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
     SlamNav_ResetSectorStats(&s_sector_current);
     taskEXIT_CRITICAL();
   }
-  SlamNav_UpdateSectorStats(robot_angle_cdeg, point->distance_mm);
+  SlamNav_UpdateSectorStats(robot_angle_cdeg, clearance_mm);
 
   if (!SlamNav_IsFrontAngle(robot_angle_cdeg))
   {
@@ -321,7 +326,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   taskEXIT_CRITICAL();
 
   local_block_mm = SlamNav_LocalBlockDistanceMm(safe_mm);
-  if (point->distance_mm <= local_block_mm)
+  if (clearance_mm <= local_block_mm)
   {
     now = HAL_GetTick();
     taskENTER_CRITICAL();
@@ -329,12 +334,12 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
     {
       s_front_blocked_since_ms = now;
     }
-    if (point->distance_mm <= safe_mm)
+    if (clearance_mm <= safe_mm)
     {
       s_front_blocked_since_ms = now - SLAM_NAV_FRONT_BLOCK_CONFIRM_MS;
     }
     s_front_blocked_until_ms = now + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
-    s_front_min_distance_mm = point->distance_mm;
+    s_front_min_distance_mm = clearance_mm;
     taskEXIT_CRITICAL();
   }
 }
@@ -1039,6 +1044,33 @@ static SlamNavSectorStats_t SlamNav_GetSectorSnapshot(uint32_t now)
 static bool SlamNav_IsSectorOpen(uint16_t distance_mm, uint16_t local_block_mm)
 {
   return (distance_mm == UINT16_MAX) || (distance_mm > local_block_mm);
+}
+
+static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm)
+{
+  uint16_t offset_mm = 0U;
+
+  if (distance_mm == 0U)
+  {
+    return 0U;
+  }
+
+  if (SlamNav_IsFrontAngle(robot_angle_cdeg))
+  {
+    offset_mm = SLAM_NAV_FRONT_BODY_OFFSET_MM;
+  }
+  else if (SlamNav_IsAngleNear(robot_angle_cdeg, SLAM_NAV_FRONT_RIGHT_CENTER_CDEG, SLAM_NAV_DIAGONAL_SECTOR_CDEG) ||
+           SlamNav_IsAngleNear(robot_angle_cdeg, SLAM_NAV_FRONT_LEFT_CENTER_CDEG, SLAM_NAV_DIAGONAL_SECTOR_CDEG))
+  {
+    offset_mm = SLAM_NAV_FRONT_DIAGONAL_BODY_OFFSET_MM;
+  }
+
+  if (offset_mm == 0U)
+  {
+    return distance_mm;
+  }
+
+  return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 1U;
 }
 
 static void SlamNav_BuildHeadingBias(const MappingGridPose_t *pose,
