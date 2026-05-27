@@ -66,16 +66,16 @@
 #define AUTO_MAPPING_CONTROL_INTERVAL_MS 50U
 #define AUTO_MAPPING_FRONT_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_SIDE_SECTOR_CDEG  3000U
-#define AUTO_MAPPING_RIGHT_CENTER_CDEG 9000U
+#define AUTO_MAPPING_RIGHT_CENTER_CDEG 27000U
 #define AUTO_MAPPING_BACK_CENTER_CDEG 18000U
-#define AUTO_MAPPING_LEFT_CENTER_CDEG  27000U
-#define AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG 4500U
-#define AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG 31500U
+#define AUTO_MAPPING_LEFT_CENTER_CDEG  9000U
+#define AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG 31500U
+#define AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG 4500U
 #define AUTO_MAPPING_DIAGONAL_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_FRONT_BODY_OFFSET_MM 200U
 #define AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
-#define AUTO_MAPPING_MIN_SAFE_MM    350U
-#define AUTO_MAPPING_MAX_SAFE_MM    3000U
+#define AUTO_MAPPING_MIN_SAFE_MM    50U
+#define AUTO_MAPPING_MAX_SAFE_MM    2000U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
@@ -94,6 +94,21 @@
 #define AUTO_MAPPING_MAX_TURN_DEG   180U
 #define AUTO_MAPPING_TURN_SETTLE_MS 240U
 #define AUTO_MAPPING_POST_TURN_DRIVE_MS 650U
+#define MODE86_CONTROL_INTERVAL_MS 50U
+#define MODE86_STEP_DISTANCE_MM    700L
+#define MODE86_STOP_MS             1000U
+#define MODE86_TURN_SETTLE_MS      200U
+#define MODE86_OBSERVE_SCAN_STARTS 3U
+#define MODE86_OBSERVE_TIMEOUT_MS  1000U
+#define MODE86_OBSERVE_SECTOR_CDEG 3000U
+#define MODE86_FRONT_BLOCK_HOLD_MS 400U
+#define MODE86_AVG_DISTANCE_NEAR_MM 100U
+#define MODE86_HEADING_HOLD_DEADBAND_CDEG 150L
+#define MODE86_HEADING_HOLD_CDEG_PER_PWM  40L
+#define MODE86_HEADING_HOLD_MAX_STEER     70L
+#define MANUAL_HEADING_HOLD_DEADBAND_CDEG 150L
+#define MANUAL_HEADING_HOLD_CDEG_PER_PWM  40L
+#define MANUAL_HEADING_HOLD_MAX_STEER     80L
 #define ANGLE_TURN_DEFAULT_DEG      90U
 #define ANGLE_TURN_MIN_DEG          1U
 #define ANGLE_TURN_MAX_DEG          360U
@@ -105,6 +120,8 @@
 #define ANGLE_TURN_FINE_ZONE_CDEG   1200L
 #define ANGLE_TURN_SLOW_PWM         450U
 #define ANGLE_TURN_FINE_PWM         320U
+#define ANGLE_TURN_INTEGRAL_GAIN_NUM 6LL
+#define ANGLE_TURN_INTEGRAL_GAIN_DEN 5LL
 #define MAPPING_START_X_MM          (-1500L)
 #define MAPPING_START_Y_MM          (-1500L)
 #define MAPPING_START_HEADING_CDEG  9000L
@@ -183,6 +200,21 @@ typedef struct
   uint8_t min_quality;
 } lidar_front_stats_t;
 
+typedef enum
+{
+  MODE86_STATE_IDLE = 0,
+  MODE86_STATE_DRIVE,
+  MODE86_STATE_STOP,
+  MODE86_STATE_OBSERVE,
+  MODE86_STATE_TURN
+} mode86_state_t;
+
+typedef struct
+{
+  uint32_t sum_mm;
+  uint16_t count;
+} mode86_sector_stats_t;
+
 static uint16_t adc_buf[ADC_CHANNEL_COUNT];
 static uint8_t oled_fb[OLED_FB_SIZE];
 static uint8_t oled_page_tx[OLED_WIDTH + 1U];
@@ -203,6 +235,7 @@ static uint32_t last_map_stat_tx_tick_ms = 0U;
 static uint32_t last_pose_tx_tick_ms = 0U;
 static uint32_t last_mapping_pose_tick_ms = 0U;
 static uint32_t mapping_start_tick_ms = 0U;
+static uint16_t obstacle_safe_distance_mm = AUTO_MAPPING_MIN_SAFE_MM;
 
 static bool lidar_result_valid = false;
 static bool mapping_active = false;
@@ -258,6 +291,25 @@ static uint8_t auto_mapping_right_branch_confirm_count = 0U;
 static uint8_t auto_mapping_observe_scan_starts_remaining = 0U;
 static bool auto_mapping_right_wall_seen = false;
 static bool auto_mapping_observe_after_resume = false;
+static bool mode86_active = false;
+static mode86_state_t mode86_state = MODE86_STATE_IDLE;
+static mode86_sector_stats_t mode86_front_stats = {0};
+static mode86_sector_stats_t mode86_right_stats = {0};
+static mode86_sector_stats_t mode86_left_stats = {0};
+static mode86_sector_stats_t mode86_back_stats = {0};
+static uint32_t mode86_state_until_ms = 0U;
+static uint32_t mode86_front_blocked_until_ms = 0U;
+static uint32_t last_mode86_control_tick_ms = 0U;
+static uint32_t mode86_cycle_count = 0U;
+static uint32_t mode86_turn_count = 0U;
+static int32_t mode86_step_start_x_mm = 0L;
+static int32_t mode86_step_start_y_mm = 0L;
+static int32_t mode86_target_heading_cdeg = MAPPING_START_HEADING_CDEG;
+static uint8_t mode86_observe_scan_starts_remaining = 0U;
+static bool mode86_turn_completed = false;
+static bool mode86_post_turn_drive_active = false;
+static bool manual_heading_hold_active = false;
+static int32_t manual_target_heading_cdeg = 0L;
 static bool gyro_calibration_active = false;
 static uint32_t gyro_calibration_start_tick_ms = 0U;
 static int64_t gyro_calibration_sum_dps_x100 = 0;
@@ -271,6 +323,7 @@ static uint8_t angle_turn_correction_count = 0U;
 static int32_t angle_turn_target_cdeg = 0L;
 static int32_t angle_turn_target_heading_cdeg = 0L;
 static int32_t angle_turn_progress_cdeg = 0L;
+static int32_t angle_turn_integral_residual = 0L;
 static uint32_t angle_turn_last_tick_ms = 0U;
 static uint32_t angle_turn_start_tick_ms = 0U;
 /* USER CODE END PV */
@@ -318,9 +371,31 @@ static void TestApp_UpdateGyroCalibration(uint32_t now_ms, int16_t left_delta, i
 static void TestApp_UpdateOdomDebug(uint32_t now_ms, int16_t left_delta, int16_t right_delta);
 static void TestApp_StreamOdomDebug(void);
 static void TestApp_SetLidarQualityFilter(const char *text);
+static void TestApp_StartManualHeadingHold(void);
+static void TestApp_StopManualHeadingHold(void);
+static void TestApp_UpdateManualHeadingHold(void);
+static int32_t TestApp_ManualHeadingHoldSteer(int32_t error_cdeg);
 static void TestApp_StartAutoMapping(void);
 static void TestApp_StopAutoMapping(void);
 static void TestApp_UpdateAutoMapping(uint32_t now_ms);
+static void TestApp_StartMode86(void);
+static void TestApp_StopMode86(void);
+static void TestApp_UpdateMode86(uint32_t now_ms);
+static void TestApp_UpdateMode86Obstacle(const LidarPoint_t *point);
+static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms);
+static void TestApp_Mode86StartStop(const char *reason, uint32_t now_ms);
+static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms);
+static void TestApp_Mode86DecideAndAct(uint32_t now_ms);
+static void TestApp_ResetMode86SectorStats(void);
+static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm);
+static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats);
+static uint16_t TestApp_Mode86SectorCountLevel(const mode86_sector_stats_t *stats);
+static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
+                                       const mode86_sector_stats_t *current_best);
+static bool TestApp_Mode86StepReached(void);
+static bool TestApp_Mode86FrontBlocked(uint32_t now_ms);
+static int32_t TestApp_Mode86HeadingHoldSteer(int32_t error_cdeg);
+static const char *TestApp_Mode86StateName(mode86_state_t state);
 static bool TestApp_IsFrontLidarPoint(uint16_t angle_cdeg);
 static bool TestApp_IsLidarAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, uint16_t half_width_cdeg);
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point);
@@ -330,13 +405,20 @@ static bool TestApp_IsAutoFrontBlocked(uint32_t now_ms);
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms);
 static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees);
 static void TestApp_StartHeadingTurn(int32_t target_heading_cdeg, uint8_t correction_count, const char *reason);
+static void TestApp_StartHeadingTurnFixed(int8_t direction,
+                                          uint16_t degrees,
+                                          int32_t target_heading_cdeg,
+                                          uint8_t correction_count,
+                                          const char *reason);
 static void TestApp_StopAngleTurn(bool completed);
 static void TestApp_UpdateAngleTurn(uint32_t now_ms);
+static int32_t TestApp_IntegrateAngleTurnDeltaCdeg(uint32_t delta_ms);
 static uint16_t TestApp_ParseTurnDegrees(const char *text);
 static uint8_t TestApp_ParseLidarQuality(const char *text, uint8_t fallback);
 static int32_t TestApp_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t TestApp_SnapHeadingToMazeAxis(int32_t heading_cdeg);
 static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t requested_degrees);
+static bool TestApp_ShouldSuppressMappingTelemetry(void);
 static void TestApp_StreamMap(void);
 static void TestApp_StreamPose(void);
 static void TestApp_RequestFullMapStream(void);
@@ -347,8 +429,11 @@ static void TestApp_ResetMapNorth(void);
 static void TestApp_SendDirState(void);
 static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
+static uint16_t AdcToSafeDistanceMm(uint16_t adc_value);
+static void TestApp_LatchObstacleSafeDistance(void);
 static uint16_t GetObstacleSafeDistanceMm(void);
 static uint16_t GetAutoFrontBlockDistanceMm(void);
+static uint16_t GetMode86SafeDistanceMm(void);
 static uint16_t TestApp_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 
 static bool OLED_InitMinimal(void);
@@ -678,10 +763,9 @@ static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value)
   return (value > max_value) ? max_value : value;
 }
 
-static uint16_t GetObstacleSafeDistanceMm(void)
+static uint16_t AdcToSafeDistanceMm(uint16_t adc_value)
 {
   uint32_t span = (uint32_t)(AUTO_MAPPING_MAX_SAFE_MM - AUTO_MAPPING_MIN_SAFE_MM);
-  uint16_t adc_value = adc_buf[2];
 
   if (adc_value > 4095U)
   {
@@ -691,6 +775,16 @@ static uint16_t GetObstacleSafeDistanceMm(void)
   return (uint16_t)(AUTO_MAPPING_MIN_SAFE_MM + (((uint32_t)adc_value * span) / 4095U));
 }
 
+static void TestApp_LatchObstacleSafeDistance(void)
+{
+  obstacle_safe_distance_mm = AdcToSafeDistanceMm(adc_buf[2]);
+}
+
+static uint16_t GetObstacleSafeDistanceMm(void)
+{
+  return obstacle_safe_distance_mm;
+}
+
 static uint16_t GetAutoFrontBlockDistanceMm(void)
 {
   uint16_t safe_mm = GetObstacleSafeDistanceMm();
@@ -698,6 +792,11 @@ static uint16_t GetAutoFrontBlockDistanceMm(void)
   return (safe_mm > AUTO_MAPPING_FRONT_BLOCK_MAX_MM) ?
       AUTO_MAPPING_FRONT_BLOCK_MAX_MM :
       safe_mm;
+}
+
+static uint16_t GetMode86SafeDistanceMm(void)
+{
+  return GetObstacleSafeDistanceMm();
 }
 
 static bool PwmValueChanged(uint16_t current, uint16_t target)
@@ -1033,7 +1132,9 @@ static void TestApp_UpdateSensors(void)
   TestApp_UpdateAngleTurn(now);
   SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
 
+  TestApp_UpdateManualHeadingHold();
   TestApp_UpdateAutoMapping(now);
+  TestApp_UpdateMode86(now);
   TestApp_UpdateMotorSpeedFromAdc();
 }
 
@@ -1056,6 +1157,7 @@ static void TestApp_InitPeripherals(void)
   (void)Mpu6500_GetState(&mpu_state);
   (void)BluetoothControl_Init();
   MappingGrid_Init();
+  TestApp_LatchObstacleSafeDistance();
   (void)SlamNav_Init();
   if (!LidarPipeline_Init())
   {
@@ -1074,15 +1176,19 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_DRIVE_FORWARD:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
-        MotorControl_SetForward(GetDrivePwmPermille());
+        TestApp_StartManualHeadingHold();
+        MotorControl_SetForwardSteer(GetDrivePwmPermille(), 0L);
         (void)BluetoothControl_SendText("MOTOR forward\r\n");
         break;
 
       case BLUETOOTH_CMD_TURN_LEFT:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_SetTurnLeft(GetTurnPwmPermille());
         (void)BluetoothControl_SendText("MOTOR left\r\n");
         break;
@@ -1090,7 +1196,9 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_TURN_RIGHT:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_SetTurnRight(GetTurnPwmPermille());
         (void)BluetoothControl_SendText("MOTOR right\r\n");
         break;
@@ -1098,7 +1206,9 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_DRIVE_STOP:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_Stop();
         (void)BluetoothControl_SendText("MOTOR brake\r\n");
         break;
@@ -1106,7 +1216,9 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_STOP_ALL:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_Stop();
         TestApp_StopMapping();
         lidar_debug_active = false;
@@ -1116,10 +1228,15 @@ static void TestApp_HandleBluetoothCommands(void)
 
       case BLUETOOTH_CMD_START_MAPPING:
         SlamNav_Stop();
+        TestApp_StopAutoMapping();
+        TestApp_StopMode86();
+        TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         TestApp_StartMapping();
         break;
 
       case BLUETOOTH_CMD_STOP_MAPPING:
+        TestApp_StopMode86();
         TestApp_StopMapping();
         (void)BluetoothControl_SendText("MAP STOP\r\n");
         break;
@@ -1153,6 +1270,8 @@ static void TestApp_HandleBluetoothCommands(void)
 
       case BLUETOOTH_CMD_AUTO_MAPPING_ON:
         SlamNav_Stop();
+        TestApp_StopMode86();
+        TestApp_StopManualHeadingHold();
         TestApp_StartAutoMapping();
         break;
 
@@ -1162,9 +1281,26 @@ static void TestApp_HandleBluetoothCommands(void)
         (void)BluetoothControl_SendText("AUTO MAP STOP\r\n");
         break;
 
-      case BLUETOOTH_CMD_SLAM_NAV_ON:
+      case BLUETOOTH_CMD_MODE86_ON:
+        SlamNav_Stop();
         TestApp_StopAutoMapping();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
+        MotorControl_Stop();
+        TestApp_StartMode86();
+        break;
+
+      case BLUETOOTH_CMD_MODE86_OFF:
+        SlamNav_Stop();
+        TestApp_StopMode86();
+        TestApp_StopMapping();
+        break;
+
+      case BLUETOOTH_CMD_SLAM_NAV_ON:
+        TestApp_StopAutoMapping();
+        TestApp_StopMode86();
+        TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_Stop();
         TestApp_StartMapping();
         SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
@@ -1179,7 +1315,9 @@ static void TestApp_HandleBluetoothCommands(void)
 
       case BLUETOOTH_CMD_SLAM_NAV_RETURN:
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_Stop();
         TestApp_ResumeMapping();
         SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
@@ -1189,7 +1327,9 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_GYRO_CALIBRATE:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
         TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
         MotorControl_Stop();
         TestApp_StopMapping();
         TestApp_StartGyroCalibration();
@@ -1214,12 +1354,16 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_TURN_LEFT_DEG:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
+        TestApp_StopManualHeadingHold();
         TestApp_StartAngleTurn(-1, TestApp_ParseTurnDegrees(command.text));
         break;
 
       case BLUETOOTH_CMD_TURN_RIGHT_DEG:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
+        TestApp_StopMode86();
+        TestApp_StopManualHeadingHold();
         TestApp_StartAngleTurn(1, TestApp_ParseTurnDegrees(command.text));
         break;
 
@@ -1314,6 +1458,7 @@ static void TestApp_ProcessLidarPoints(void)
     {
       TestApp_UpdateLidarFrontStats(&point);
       TestApp_UpdateAutoMappingObstacle(&point);
+      TestApp_UpdateMode86Obstacle(&point);
       SlamNav_ObserveLidarPoint(&point);
     }
 
@@ -1389,6 +1534,10 @@ static void TestApp_UpdateLidarFrontStats(const LidarPoint_t *point)
     return;
   }
   clearance_mm = TestApp_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
+  if (clearance_mm == 0U)
+  {
+    return;
+  }
 
   lidar_front_current.point_count++;
   lidar_front_current.last_tick_ms = HAL_GetTick();
@@ -1475,7 +1624,11 @@ static void TestApp_UpdateMappingPose(uint32_t now_ms, int16_t left_delta, int16
 
   if (!mapping_active)
   {
-    if (!auto_mapping_active && !angle_turn_active && !SlamNav_IsActive())
+    if (!manual_heading_hold_active &&
+        !auto_mapping_active &&
+        !mode86_active &&
+        !angle_turn_active &&
+        !SlamNav_IsActive())
     {
       last_mapping_pose_tick_ms = now_ms;
       return;
@@ -1741,6 +1894,81 @@ static void TestApp_SetLidarQualityFilter(const char *text)
   (void)BluetoothControl_SendText(line);
 }
 
+static void TestApp_StartManualHeadingHold(void)
+{
+  uint32_t now = HAL_GetTick();
+  char line[96];
+
+  manual_target_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg);
+  manual_heading_hold_active = true;
+  last_mapping_pose_tick_ms = now;
+  mapping_travel_residual_x1000 = 0L;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MOTOR HOLD target=%ld mpu=%u\r\n",
+      (long)manual_target_heading_cdeg,
+      (unsigned int)mpu_state.ready);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_StopManualHeadingHold(void)
+{
+  manual_heading_hold_active = false;
+}
+
+static void TestApp_UpdateManualHeadingHold(void)
+{
+  MotorControlState_t motor_state = {0};
+  int32_t error_cdeg;
+  int32_t steering_permille;
+
+  if (!manual_heading_hold_active)
+  {
+    return;
+  }
+
+  if (auto_mapping_active || mode86_active || angle_turn_active || SlamNav_IsActive())
+  {
+    manual_heading_hold_active = false;
+    return;
+  }
+
+  if (!MotorControl_GetState(&motor_state) || !motor_state.forward_active)
+  {
+    manual_heading_hold_active = false;
+    return;
+  }
+
+  error_cdeg = TestApp_SignedHeadingErrorCdeg(manual_target_heading_cdeg, mapping_pose.heading_cdeg);
+  steering_permille = mpu_state.ready ? TestApp_ManualHeadingHoldSteer(error_cdeg) : 0L;
+  MotorControl_SetForwardSteer(GetDrivePwmPermille(), steering_permille);
+}
+
+static int32_t TestApp_ManualHeadingHoldSteer(int32_t error_cdeg)
+{
+  int32_t steer;
+
+  if (AppAbs32(error_cdeg) <= MANUAL_HEADING_HOLD_DEADBAND_CDEG)
+  {
+    return 0L;
+  }
+
+  steer = error_cdeg / MANUAL_HEADING_HOLD_CDEG_PER_PWM;
+  if (steer > MANUAL_HEADING_HOLD_MAX_STEER)
+  {
+    return MANUAL_HEADING_HOLD_MAX_STEER;
+  }
+
+  if (steer < -MANUAL_HEADING_HOLD_MAX_STEER)
+  {
+    return -MANUAL_HEADING_HOLD_MAX_STEER;
+  }
+
+  return steer;
+}
+
 static uint16_t TestApp_ParseTurnDegrees(const char *text)
 {
   uint32_t value = 0U;
@@ -1828,6 +2056,7 @@ static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
   angle_turn_target_cdeg = (int32_t)degrees * 100L;
   angle_turn_target_heading_cdeg = 0L;
   angle_turn_progress_cdeg = 0L;
+  angle_turn_integral_residual = 0L;
   angle_turn_start_tick_ms = HAL_GetTick();
   angle_turn_last_tick_ms = angle_turn_start_tick_ms;
 
@@ -1853,7 +2082,6 @@ static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
 
 static void TestApp_StartHeadingTurn(int32_t target_heading_cdeg, uint8_t correction_count, const char *reason)
 {
-  char line[96];
   int32_t error_cdeg;
   uint16_t degrees;
   int8_t direction;
@@ -1866,6 +2094,21 @@ static void TestApp_StartHeadingTurn(int32_t target_heading_cdeg, uint8_t correc
     degrees = ANGLE_TURN_MIN_DEG;
   }
   direction = (error_cdeg >= 0L) ? -1 : 1;
+
+  TestApp_StartHeadingTurnFixed(direction, degrees, target_heading_cdeg, correction_count, reason);
+}
+
+static void TestApp_StartHeadingTurnFixed(int8_t direction,
+                                          uint16_t degrees,
+                                          int32_t target_heading_cdeg,
+                                          uint8_t correction_count,
+                                          const char *reason)
+{
+  char line[112];
+  int32_t error_cdeg;
+
+  target_heading_cdeg = NormalizeHeadingCdeg(target_heading_cdeg);
+  error_cdeg = TestApp_SignedHeadingErrorCdeg(target_heading_cdeg, mapping_pose.heading_cdeg);
 
   TestApp_StartAngleTurn(direction, degrees);
   angle_turn_heading_target_valid = true;
@@ -1916,9 +2159,12 @@ static void TestApp_StopAngleTurn(bool completed)
   angle_turn_direction = 0;
   angle_turn_heading_target_valid = false;
   angle_turn_completed_by_progress = false;
+  angle_turn_integral_residual = 0L;
   MotorControl_Stop();
 
-  if (completed && heading_target_valid && completed_by_progress)
+  if (completed &&
+      heading_target_valid &&
+      (AppAbs32(heading_error_cdeg) <= ANGLE_TURN_DONE_TOL_CDEG))
   {
     mapping_pose.heading_cdeg = NormalizeHeadingCdeg(target_heading_cdeg);
     if (mapping_active)
@@ -1936,6 +2182,14 @@ static void TestApp_StopAngleTurn(bool completed)
   {
     TestApp_StartHeadingTurn(target_heading_cdeg, (uint8_t)(correction_count + 1U), "CORRECT");
     return;
+  }
+
+  if (mode86_active && (mode86_state == MODE86_STATE_TURN))
+  {
+    mode86_turn_completed =
+        completed &&
+        (!heading_target_valid ||
+         (AppAbs32(heading_error_cdeg) <= ANGLE_TURN_DONE_TOL_CDEG));
   }
 
   if (auto_mapping_active)
@@ -1982,7 +2236,7 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
 
   delta_ms = now_ms - angle_turn_last_tick_ms;
   angle_turn_last_tick_ms = now_ms;
-  delta_cdeg = (gyro_z_corrected_dps_x100 * (int32_t)delta_ms) / 1000L;
+  delta_cdeg = TestApp_IntegrateAngleTurnDeltaCdeg(delta_ms);
   angle_turn_progress_cdeg += AppAbs32(delta_cdeg);
   progress_remaining_cdeg = angle_turn_target_cdeg - angle_turn_progress_cdeg;
 
@@ -1991,9 +2245,7 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
     heading_remaining_cdeg = AppAbs32(TestApp_SignedHeadingErrorCdeg(
         angle_turn_target_heading_cdeg,
         mapping_pose.heading_cdeg));
-    remaining_cdeg = (progress_remaining_cdeg < heading_remaining_cdeg) ?
-        progress_remaining_cdeg :
-        heading_remaining_cdeg;
+    remaining_cdeg = heading_remaining_cdeg;
   }
   else
   {
@@ -2001,12 +2253,18 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
     remaining_cdeg = progress_remaining_cdeg;
   }
 
-  if (remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG)
+  if (angle_turn_heading_target_valid)
   {
-    angle_turn_completed_by_progress =
-        angle_turn_heading_target_valid &&
-        (progress_remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG) &&
-        (heading_remaining_cdeg > ANGLE_TURN_DONE_TOL_CDEG);
+    if (heading_remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG)
+    {
+      angle_turn_completed_by_progress = false;
+      TestApp_StopAngleTurn(true);
+      return;
+    }
+  }
+  else if (remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG)
+  {
+    angle_turn_completed_by_progress = true;
     TestApp_StopAngleTurn(true);
     return;
   }
@@ -2035,6 +2293,24 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
   {
     MotorControl_SetTurnRight(turn_pwm);
   }
+}
+
+static int32_t TestApp_IntegrateAngleTurnDeltaCdeg(uint32_t delta_ms)
+{
+  int64_t numerator;
+  int64_t denominator;
+  int32_t delta_cdeg;
+
+  numerator =
+      ((int64_t)gyro_z_corrected_dps_x100 *
+       (int64_t)delta_ms *
+       ANGLE_TURN_INTEGRAL_GAIN_NUM) +
+      (int64_t)angle_turn_integral_residual;
+  denominator = 1000LL * ANGLE_TURN_INTEGRAL_GAIN_DEN;
+  delta_cdeg = (int32_t)(numerator / denominator);
+  angle_turn_integral_residual = (int32_t)(numerator - ((int64_t)delta_cdeg * denominator));
+
+  return delta_cdeg;
 }
 
 static void TestApp_StartAutoMapping(void)
@@ -2079,6 +2355,581 @@ static void TestApp_StopAutoMapping(void)
   auto_mapping_right_wall_seen = false;
   auto_mapping_observe_after_resume = false;
   MotorControl_Stop();
+}
+
+static void TestApp_StartMode86(void)
+{
+  uint32_t now = HAL_GetTick();
+  char line[128];
+
+  mode86_active = true;
+  mode86_state = MODE86_STATE_IDLE;
+  mode86_state_until_ms = 0U;
+  mode86_front_blocked_until_ms = 0U;
+  last_mode86_control_tick_ms = 0U;
+  mode86_cycle_count = 0U;
+  mode86_turn_count = 0U;
+  mode86_observe_scan_starts_remaining = 0U;
+  mode86_turn_completed = false;
+  mode86_post_turn_drive_active = false;
+  TestApp_ResetMode86SectorStats();
+
+  TestApp_StartMapping();
+  mode86_target_heading_cdeg = TestApp_SnapHeadingToMazeAxis(mapping_pose.heading_cdeg);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 START step=%ld stop=%u safe=%u heading=%ld\r\n",
+      (long)MODE86_STEP_DISTANCE_MM,
+      (unsigned int)MODE86_STOP_MS,
+      (unsigned int)GetMode86SafeDistanceMm(),
+      (long)mode86_target_heading_cdeg);
+  (void)BluetoothControl_SendText(line);
+
+  TestApp_Mode86StartDrive("START", now);
+}
+
+static void TestApp_StopMode86(void)
+{
+  if (!mode86_active)
+  {
+    return;
+  }
+
+  mode86_active = false;
+  mode86_state = MODE86_STATE_IDLE;
+  mode86_state_until_ms = 0U;
+  mode86_front_blocked_until_ms = 0U;
+  last_mode86_control_tick_ms = 0U;
+  mode86_observe_scan_starts_remaining = 0U;
+  mode86_turn_completed = false;
+  mode86_post_turn_drive_active = false;
+  TestApp_ResetMode86SectorStats();
+  if (angle_turn_active)
+  {
+    TestApp_StopAngleTurn(false);
+  }
+  MotorControl_Stop();
+  (void)BluetoothControl_SendText("MODE86 STOP\r\n");
+}
+
+static void TestApp_UpdateMode86(uint32_t now_ms)
+{
+  uint16_t drive_pwm;
+  int32_t heading_error_cdeg;
+  int32_t steering_permille;
+
+  if (!mode86_active)
+  {
+    return;
+  }
+
+  if (mode86_state == MODE86_STATE_TURN)
+  {
+    if (angle_turn_active)
+    {
+      return;
+    }
+
+    if (mode86_turn_completed)
+    {
+      MotorControl_Stop();
+      if (mode86_state_until_ms == 0U)
+      {
+        mode86_state_until_ms = now_ms + MODE86_TURN_SETTLE_MS;
+        return;
+      }
+
+      if ((int32_t)(now_ms - mode86_state_until_ms) < 0L)
+      {
+        return;
+      }
+
+      mode86_state_until_ms = 0U;
+      TestApp_Mode86StartDrive("AFTER_TURN", now_ms);
+    }
+    else
+    {
+      TestApp_Mode86StartStop("TURN_ABORT", now_ms);
+    }
+    return;
+  }
+
+  if ((now_ms - last_mode86_control_tick_ms) < MODE86_CONTROL_INTERVAL_MS)
+  {
+    return;
+  }
+  last_mode86_control_tick_ms = now_ms;
+
+  switch (mode86_state)
+  {
+    case MODE86_STATE_DRIVE:
+      if (!mode86_post_turn_drive_active && TestApp_Mode86FrontBlocked(now_ms))
+      {
+        TestApp_Mode86StartStop("FRONT_BLOCKED", now_ms);
+        return;
+      }
+
+      if (TestApp_Mode86StepReached())
+      {
+        mode86_post_turn_drive_active = false;
+        TestApp_Mode86StartStop("STEP_DONE", now_ms);
+        return;
+      }
+
+      drive_pwm = ClampPwmPermille(GetDrivePwmPermille(), AUTO_MAPPING_MAX_DRIVE_PWM);
+      heading_error_cdeg = TestApp_SignedHeadingErrorCdeg(mode86_target_heading_cdeg, mapping_pose.heading_cdeg);
+      steering_permille = TestApp_Mode86HeadingHoldSteer(heading_error_cdeg);
+      MotorControl_SetForwardSteer(drive_pwm, steering_permille);
+      break;
+
+    case MODE86_STATE_STOP:
+      MotorControl_Stop();
+      if ((int32_t)(now_ms - mode86_state_until_ms) >= 0L)
+      {
+        TestApp_Mode86StartObservation("TIMER", now_ms);
+      }
+      break;
+
+    case MODE86_STATE_OBSERVE:
+      MotorControl_Stop();
+      if ((mode86_observe_scan_starts_remaining > 0U) &&
+          ((int32_t)(now_ms - mode86_state_until_ms) < 0L))
+      {
+        return;
+      }
+      mode86_observe_scan_starts_remaining = 0U;
+      TestApp_Mode86DecideAndAct(now_ms);
+      break;
+
+    case MODE86_STATE_IDLE:
+    default:
+      TestApp_Mode86StartDrive("IDLE", now_ms);
+      break;
+  }
+}
+
+static void TestApp_UpdateMode86Obstacle(const LidarPoint_t *point)
+{
+  uint16_t robot_angle_cdeg;
+  uint16_t clearance_mm;
+
+  if ((point == NULL) || !mode86_active)
+  {
+    return;
+  }
+
+  if ((point->distance_mm == 0U) ||
+      (point->quality == 0U))
+  {
+    return;
+  }
+
+  robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
+  clearance_mm = TestApp_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
+
+  if (mode86_state == MODE86_STATE_DRIVE)
+  {
+    if (clearance_mm == 0U)
+    {
+      return;
+    }
+
+    if (mode86_post_turn_drive_active)
+    {
+      return;
+    }
+
+    if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
+        (clearance_mm <= GetMode86SafeDistanceMm()))
+    {
+      mode86_front_blocked_until_ms = HAL_GetTick() + MODE86_FRONT_BLOCK_HOLD_MS;
+      MotorControl_Stop();
+    }
+    return;
+  }
+
+  if (mode86_state != MODE86_STATE_OBSERVE)
+  {
+    return;
+  }
+
+  if (((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U) &&
+      (mode86_observe_scan_starts_remaining > 0U))
+  {
+    mode86_observe_scan_starts_remaining--;
+  }
+
+  if (clearance_mm == 0U)
+  {
+    return;
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, 0U, MODE86_OBSERVE_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_front_stats, clearance_mm);
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_right_stats, point->distance_mm);
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_left_stats, point->distance_mm);
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_BACK_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_back_stats, point->distance_mm);
+  }
+}
+
+static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
+{
+  char line[160];
+
+  mode86_state = MODE86_STATE_DRIVE;
+  mode86_state_until_ms = 0U;
+  mode86_front_blocked_until_ms = 0U;
+  mode86_step_start_x_mm = mapping_pose.x_mm;
+  mode86_step_start_y_mm = mapping_pose.y_mm;
+  mode86_cycle_count++;
+  mode86_turn_completed = false;
+  mode86_post_turn_drive_active =
+      ((reason != NULL) && (strcmp(reason, "AFTER_TURN") == 0));
+  TestApp_ResetMode86SectorStats();
+
+  if (reason == NULL)
+  {
+    reason = "DRIVE";
+  }
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 DRIVE reason=%s cycle=%lu pose=%ld,%ld heading=%ld target=%ld post=%u\r\n",
+      reason,
+      (unsigned long)mode86_cycle_count,
+      (long)mapping_pose.x_mm,
+      (long)mapping_pose.y_mm,
+      (long)mapping_pose.heading_cdeg,
+      (long)mode86_target_heading_cdeg,
+      (unsigned int)mode86_post_turn_drive_active);
+  (void)BluetoothControl_SendText(line);
+
+  last_mode86_control_tick_ms = (now_ms >= MODE86_CONTROL_INTERVAL_MS) ?
+      (now_ms - MODE86_CONTROL_INTERVAL_MS) :
+      0U;
+}
+
+static void TestApp_Mode86StartStop(const char *reason, uint32_t now_ms)
+{
+  char line[160];
+
+  MotorControl_Stop();
+  mode86_state = MODE86_STATE_STOP;
+  mode86_state_until_ms = now_ms + MODE86_STOP_MS;
+  mode86_observe_scan_starts_remaining = 0U;
+  mode86_post_turn_drive_active = false;
+  TestApp_ResetMode86SectorStats();
+
+  if (reason == NULL)
+  {
+    reason = "STOP";
+  }
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 STOPPING reason=%s state=%s pose=%ld,%ld heading=%ld wait=%u\r\n",
+      reason,
+      TestApp_Mode86StateName(mode86_state),
+      (long)mapping_pose.x_mm,
+      (long)mapping_pose.y_mm,
+      (long)mapping_pose.heading_cdeg,
+      (unsigned int)MODE86_STOP_MS);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms)
+{
+  char line[128];
+
+  MotorControl_Stop();
+  mode86_state = MODE86_STATE_OBSERVE;
+  mode86_state_until_ms = now_ms + MODE86_OBSERVE_TIMEOUT_MS;
+  mode86_observe_scan_starts_remaining = MODE86_OBSERVE_SCAN_STARTS;
+  mode86_post_turn_drive_active = false;
+  TestApp_ResetMode86SectorStats();
+
+  if (reason == NULL)
+  {
+    reason = "OBSERVE";
+  }
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 OBSERVE reason=%s scans=%u timeout=%u\r\n",
+      reason,
+      (unsigned int)MODE86_OBSERVE_SCAN_STARTS,
+      (unsigned int)MODE86_OBSERVE_TIMEOUT_MS);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
+{
+  const mode86_sector_stats_t *best_stats = &mode86_front_stats;
+  uint16_t safe_mm = GetMode86SafeDistanceMm();
+  uint16_t front_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_front_stats);
+  uint16_t right_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_right_stats);
+  uint16_t left_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_left_stats);
+  uint16_t back_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_back_stats);
+  uint16_t front_level = TestApp_Mode86SectorCountLevel(&mode86_front_stats);
+  uint16_t right_level = TestApp_Mode86SectorCountLevel(&mode86_right_stats);
+  uint16_t left_level = TestApp_Mode86SectorCountLevel(&mode86_left_stats);
+  uint16_t back_level = TestApp_Mode86SectorCountLevel(&mode86_back_stats);
+  const char *reason = "BEST_FRONT";
+  char dir = 'F';
+  int8_t turn_direction = 0;
+  uint16_t turn_degrees = 0U;
+  int32_t turn_step_cdeg = 0L;
+  int32_t target_heading_cdeg = mode86_target_heading_cdeg;
+  bool u_turn_required =
+      (mode86_front_stats.count > 0U) &&
+      (mode86_right_stats.count > 0U) &&
+      (mode86_left_stats.count > 0U) &&
+      (front_avg_mm < safe_mm) &&
+      (right_avg_mm < safe_mm) &&
+      (left_avg_mm < safe_mm);
+  char line[224];
+
+  if (u_turn_required)
+  {
+    reason = "ALL_AVG_LT_SAFE";
+    dir = 'B';
+    turn_direction = 1;
+    turn_degrees = AUTO_MAPPING_U_TURN_DEG;
+  }
+  else
+  {
+    if (TestApp_Mode86SectorBetter(&mode86_right_stats, best_stats))
+    {
+      best_stats = &mode86_right_stats;
+      reason = "BEST_RIGHT";
+      dir = 'R';
+    }
+
+    if (TestApp_Mode86SectorBetter(&mode86_left_stats, best_stats))
+    {
+      best_stats = &mode86_left_stats;
+      reason = "BEST_LEFT";
+      dir = 'L';
+    }
+
+    if (dir == 'R')
+    {
+      turn_direction = 1;
+      turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    }
+    else if (dir == 'L')
+    {
+      turn_direction = -1;
+      turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    }
+  }
+
+  if (dir == 'F')
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "MODE86 DECIDE dir=F reason=%s dirs=F,R,L,B avg=%u,%u,%u,%u count=%u,%u,%u,%u level=%u,%u,%u,%u safe=%u turns=%lu\r\n",
+        reason,
+        (unsigned int)front_avg_mm,
+        (unsigned int)right_avg_mm,
+        (unsigned int)left_avg_mm,
+        (unsigned int)back_avg_mm,
+        (unsigned int)mode86_front_stats.count,
+        (unsigned int)mode86_right_stats.count,
+        (unsigned int)mode86_left_stats.count,
+        (unsigned int)mode86_back_stats.count,
+        (unsigned int)front_level,
+        (unsigned int)right_level,
+        (unsigned int)left_level,
+        (unsigned int)back_level,
+        (unsigned int)safe_mm,
+        (unsigned long)mode86_turn_count);
+    (void)BluetoothControl_SendText(line);
+    TestApp_Mode86StartDrive(reason, now_ms);
+    return;
+  }
+
+  turn_step_cdeg = (turn_degrees >= 135U) ? 18000L : 9000L;
+  if (turn_direction < 0)
+  {
+    target_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg + turn_step_cdeg);
+  }
+  else
+  {
+    target_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg - turn_step_cdeg);
+  }
+  mode86_target_heading_cdeg = target_heading_cdeg;
+  mode86_state = MODE86_STATE_TURN;
+  mode86_state_until_ms = 0U;
+  mode86_turn_completed = false;
+  mode86_turn_count++;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 DECIDE dir=%c reason=%s dirs=F,R,L,B avg=%u,%u,%u,%u count=%u,%u,%u,%u level=%u,%u,%u,%u safe=%u target=%ld turns=%lu\r\n",
+      dir,
+      reason,
+      (unsigned int)front_avg_mm,
+      (unsigned int)right_avg_mm,
+      (unsigned int)left_avg_mm,
+      (unsigned int)back_avg_mm,
+      (unsigned int)mode86_front_stats.count,
+      (unsigned int)mode86_right_stats.count,
+      (unsigned int)mode86_left_stats.count,
+      (unsigned int)mode86_back_stats.count,
+      (unsigned int)front_level,
+      (unsigned int)right_level,
+      (unsigned int)left_level,
+      (unsigned int)back_level,
+      (unsigned int)safe_mm,
+      (long)target_heading_cdeg,
+      (unsigned long)mode86_turn_count);
+  (void)BluetoothControl_SendText(line);
+
+  TestApp_StartHeadingTurnFixed(turn_direction, turn_degrees, target_heading_cdeg, 0U, reason);
+}
+
+static void TestApp_ResetMode86SectorStats(void)
+{
+  mode86_front_stats.sum_mm = 0U;
+  mode86_front_stats.count = 0U;
+  mode86_right_stats.sum_mm = 0U;
+  mode86_right_stats.count = 0U;
+  mode86_left_stats.sum_mm = 0U;
+  mode86_left_stats.count = 0U;
+  mode86_back_stats.sum_mm = 0U;
+  mode86_back_stats.count = 0U;
+}
+
+static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm)
+{
+  if ((stats == NULL) || (stats->count == UINT16_MAX))
+  {
+    return;
+  }
+
+  stats->sum_mm += distance_mm;
+  stats->count++;
+}
+
+static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats)
+{
+  uint32_t average_mm;
+
+  if ((stats == NULL) || (stats->count == 0U))
+  {
+    return 0U;
+  }
+
+  average_mm = stats->sum_mm / (uint32_t)stats->count;
+  return (average_mm > UINT16_MAX) ? UINT16_MAX : (uint16_t)average_mm;
+}
+
+static uint16_t TestApp_Mode86SectorCountLevel(const mode86_sector_stats_t *stats)
+{
+  if (stats == NULL)
+  {
+    return 0U;
+  }
+
+  return (uint16_t)(stats->count / 10U);
+}
+
+static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
+                                       const mode86_sector_stats_t *current_best)
+{
+  uint16_t candidate_avg = TestApp_Mode86SectorAverageMm(candidate);
+  uint16_t best_avg = TestApp_Mode86SectorAverageMm(current_best);
+  uint16_t avg_delta =
+      (candidate_avg > best_avg) ?
+      (uint16_t)(candidate_avg - best_avg) :
+      (uint16_t)(best_avg - candidate_avg);
+  uint16_t candidate_level = TestApp_Mode86SectorCountLevel(candidate);
+  uint16_t best_level = TestApp_Mode86SectorCountLevel(current_best);
+
+  if (avg_delta > MODE86_AVG_DISTANCE_NEAR_MM)
+  {
+    return candidate_avg > best_avg;
+  }
+
+  if (candidate_level != best_level)
+  {
+    return candidate_level > best_level;
+  }
+
+  return candidate_avg > best_avg;
+}
+
+static bool TestApp_Mode86StepReached(void)
+{
+  int64_t dx_mm = (int64_t)mapping_pose.x_mm - (int64_t)mode86_step_start_x_mm;
+  int64_t dy_mm = (int64_t)mapping_pose.y_mm - (int64_t)mode86_step_start_y_mm;
+  int64_t distance_sq_mm = (dx_mm * dx_mm) + (dy_mm * dy_mm);
+  int64_t target_sq_mm = (int64_t)MODE86_STEP_DISTANCE_MM * (int64_t)MODE86_STEP_DISTANCE_MM;
+
+  return distance_sq_mm >= target_sq_mm;
+}
+
+static bool TestApp_Mode86FrontBlocked(uint32_t now_ms)
+{
+  return ((mode86_front_blocked_until_ms != 0U) &&
+          ((int32_t)(now_ms - mode86_front_blocked_until_ms) < 0L));
+}
+
+static int32_t TestApp_Mode86HeadingHoldSteer(int32_t error_cdeg)
+{
+  int32_t steer;
+
+  if (AppAbs32(error_cdeg) <= MODE86_HEADING_HOLD_DEADBAND_CDEG)
+  {
+    return 0L;
+  }
+
+  steer = error_cdeg / MODE86_HEADING_HOLD_CDEG_PER_PWM;
+  if (steer > MODE86_HEADING_HOLD_MAX_STEER)
+  {
+    return MODE86_HEADING_HOLD_MAX_STEER;
+  }
+
+  if (steer < -MODE86_HEADING_HOLD_MAX_STEER)
+  {
+    return -MODE86_HEADING_HOLD_MAX_STEER;
+  }
+
+  return steer;
+}
+
+static const char *TestApp_Mode86StateName(mode86_state_t state)
+{
+  switch (state)
+  {
+    case MODE86_STATE_DRIVE:   return "DRIVE";
+    case MODE86_STATE_STOP:    return "STOP";
+    case MODE86_STATE_OBSERVE: return "OBSERVE";
+    case MODE86_STATE_TURN:    return "TURN";
+    case MODE86_STATE_IDLE:
+    default:                   return "IDLE";
+  }
 }
 
 static bool TestApp_IsFrontLidarPoint(uint16_t angle_cdeg)
@@ -2127,7 +2978,7 @@ static uint16_t TestApp_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16
     return distance_mm;
   }
 
-  return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 1U;
+  return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 0U;
 }
 
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
@@ -2153,6 +3004,11 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
       (auto_mapping_observe_scan_starts_remaining > 0U))
   {
     auto_mapping_observe_scan_starts_remaining--;
+  }
+
+  if (clearance_mm == 0U)
+  {
+    return;
   }
 
   if (TestApp_IsFrontLidarPoint(robot_angle_cdeg))
@@ -2495,6 +3351,11 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   (void)BluetoothControl_SendText(line);
 }
 
+static bool TestApp_ShouldSuppressMappingTelemetry(void)
+{
+  return auto_mapping_active || mode86_active;
+}
+
 static void TestApp_StreamMap(void)
 {
   char row_text[MAPPING_GRID_WIDTH_CELLS + 1U];
@@ -2503,7 +3364,7 @@ static void TestApp_StreamMap(void)
   uint32_t revision;
   uint8_t rows_sent = 0U;
 
-  if (!mapping_active)
+  if (!mapping_active || TestApp_ShouldSuppressMappingTelemetry())
   {
     return;
   }
@@ -2551,7 +3412,7 @@ static void TestApp_StreamPose(void)
   char line[128];
   uint32_t now = HAL_GetTick();
 
-  if (!mapping_active)
+  if (!mapping_active || TestApp_ShouldSuppressMappingTelemetry())
   {
     return;
   }
@@ -2581,6 +3442,11 @@ static void TestApp_StreamPose(void)
 
 static void TestApp_RequestFullMapStream(void)
 {
+  if (TestApp_ShouldSuppressMappingTelemetry())
+  {
+    return;
+  }
+
   next_map_tx_row = 0U;
   last_map_row_tx_tick_ms = 0U;
   TestApp_SendMapHeader(mapping_active ? "SNAP" : "IDLE");
@@ -2590,6 +3456,11 @@ static void TestApp_RequestFullMapStream(void)
 static void TestApp_SendMapHeader(const char *state)
 {
   char line[96];
+
+  if (TestApp_ShouldSuppressMappingTelemetry())
+  {
+    return;
+  }
 
   if (state == NULL)
   {
@@ -2613,6 +3484,11 @@ static void TestApp_SendMapStat(void)
   MappingGridStats_t stats;
   BluetoothControlState_t bt_state = {0};
   char line[224];
+
+  if (TestApp_ShouldSuppressMappingTelemetry())
+  {
+    return;
+  }
 
   if (!MappingGrid_GetStats(&stats))
   {
@@ -2715,7 +3591,11 @@ static void TestApp_UpdateMotorSpeedFromAdc(void)
   MotorControlState_t motor_state = {0};
   uint16_t target_pwm;
 
-  if (auto_mapping_active || angle_turn_active || SlamNav_IsActive())
+  if (manual_heading_hold_active ||
+      auto_mapping_active ||
+      mode86_active ||
+      angle_turn_active ||
+      SlamNav_IsActive())
   {
     return;
   }
@@ -2767,6 +3647,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+
   HAL_Init();
 
   /* USER CODE BEGIN Init */

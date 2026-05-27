@@ -4,12 +4,9 @@
 
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
 #define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
-#define ASTAR_FRONTIER_NO_BIAS 0xFFU
-#define ASTAR_FRONTIER_DISTANCE_WEIGHT 4U
-#define ASTAR_FRONTIER_HEADING_WEIGHT 1U
 #define ASTAR_OBSTACLE_INFLATION_CELLS 0
 #define ASTAR_FREE_STEP_COST 1U
-#define ASTAR_HEURISTIC_WEIGHT 3U
+#define ASTAR_HEURISTIC_WEIGHT 1U
 #define ASTAR_NODE_FLAG_OPEN 0x01U
 #define ASTAR_NODE_FLAG_CLOSED 0x02U
 #define ASTAR_COST_INF 0xFFFFU
@@ -18,7 +15,6 @@ typedef struct
 {
   uint16_t index;
   uint16_t distance;
-  uint8_t preference;
 } AstarFrontierCandidate_t;
 
 static uint16_t s_g_score[ASTAR_TOTAL_CELLS];
@@ -41,27 +37,12 @@ static bool Astar_IsFrontierCandidate(const MappingGridSnapshot_t *snapshot,
 static AstarPlannerStatus_t Astar_PlanToFrontierInternal(const MappingGridSnapshot_t *snapshot,
                                                          uint8_t start_x,
                                                          uint8_t start_y,
-                                                         const int32_t *preferred_headings_cdeg,
-                                                         uint8_t preferred_heading_count,
                                                          AstarPlannerPath_t *out_path);
 static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
-                                               uint8_t start_y,
-                                               const int32_t *preferred_headings_cdeg,
-                                               uint8_t preferred_heading_count);
-static uint8_t Astar_CandidatePreference(uint8_t start_x,
-                                         uint8_t start_y,
-                                         uint8_t goal_x,
-                                         uint8_t goal_y,
-                                         const int32_t *preferred_headings_cdeg,
-                                         uint8_t preferred_heading_count);
-static int32_t Astar_CandidateHeadingCdeg(uint8_t start_x, uint8_t start_y, uint8_t goal_x, uint8_t goal_y);
-static bool Astar_CandidateBetter(uint8_t preference,
-                                  uint16_t distance,
-                                  uint8_t other_preference,
-                                  uint16_t other_distance);
-static uint16_t Astar_CandidateScore(uint8_t preference, uint16_t distance);
-static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t preference, uint8_t *count);
+                                               uint8_t start_y);
+static bool Astar_CandidateBetter(uint16_t distance, uint16_t other_distance);
+static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *count);
 static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
                                                uint8_t start_y,
@@ -73,39 +54,18 @@ static bool Astar_ReconstructPath(uint16_t start_index,
                                   AstarPlannerPath_t *out_path);
 static void Astar_ClearSearch(void);
 static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y);
-static int32_t Astar_NormalizeHeadingCdeg(int32_t heading_cdeg);
-static int32_t Astar_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
-static int32_t Astar_Abs32(int32_t value);
 
 AstarPlannerStatus_t AstarPlanner_PlanToFrontier(const MappingGridSnapshot_t *snapshot,
                                                  uint8_t start_x,
                                                  uint8_t start_y,
                                                  AstarPlannerPath_t *out_path)
 {
-  return Astar_PlanToFrontierInternal(snapshot, start_x, start_y, NULL, 0U, out_path);
-}
-
-AstarPlannerStatus_t AstarPlanner_PlanToFrontierBiased(const MappingGridSnapshot_t *snapshot,
-                                                       uint8_t start_x,
-                                                       uint8_t start_y,
-                                                       const int32_t *preferred_headings_cdeg,
-                                                       uint8_t preferred_heading_count,
-                                                       AstarPlannerPath_t *out_path)
-{
-  return Astar_PlanToFrontierInternal(
-      snapshot,
-      start_x,
-      start_y,
-      preferred_headings_cdeg,
-      preferred_heading_count,
-      out_path);
+  return Astar_PlanToFrontierInternal(snapshot, start_x, start_y, out_path);
 }
 
 static AstarPlannerStatus_t Astar_PlanToFrontierInternal(const MappingGridSnapshot_t *snapshot,
                                                          uint8_t start_x,
                                                          uint8_t start_y,
-                                                         const int32_t *preferred_headings_cdeg,
-                                                         uint8_t preferred_heading_count,
                                                          AstarPlannerPath_t *out_path)
 {
   uint8_t candidate_count;
@@ -130,9 +90,7 @@ static AstarPlannerStatus_t Astar_PlanToFrontierInternal(const MappingGridSnapsh
   candidate_count = Astar_CollectFrontierCandidates(
       snapshot,
       start_x,
-      start_y,
-      preferred_headings_cdeg,
-      preferred_heading_count);
+      start_y);
   if (candidate_count == 0U)
   {
     out_path->status = ASTAR_PLANNER_STATUS_NO_FRONTIER;
@@ -345,9 +303,7 @@ static bool Astar_IsFrontierCandidate(const MappingGridSnapshot_t *snapshot,
 
 static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
-                                               uint8_t start_y,
-                                               const int32_t *preferred_headings_cdeg,
-                                               uint8_t preferred_heading_count)
+                                               uint8_t start_y)
 {
   uint8_t count = 0U;
   uint8_t x;
@@ -362,13 +318,6 @@ static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snap
         Astar_InsertCandidate(
             Astar_Index(x, y),
             Astar_Manhattan(start_x, start_y, x, y),
-            Astar_CandidatePreference(
-                start_x,
-                start_y,
-                x,
-                y,
-                preferred_headings_cdeg,
-                preferred_heading_count),
             &count);
       }
     }
@@ -377,91 +326,12 @@ static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snap
   return count;
 }
 
-static uint8_t Astar_CandidatePreference(uint8_t start_x,
-                                         uint8_t start_y,
-                                         uint8_t goal_x,
-                                         uint8_t goal_y,
-                                         const int32_t *preferred_headings_cdeg,
-                                         uint8_t preferred_heading_count)
+static bool Astar_CandidateBetter(uint16_t distance, uint16_t other_distance)
 {
-  int32_t heading_cdeg;
-  uint8_t i;
-  uint8_t best_index = 0U;
-  int32_t best_error = 36000L;
-
-  if ((preferred_headings_cdeg == NULL) || (preferred_heading_count == 0U))
-  {
-    return ASTAR_FRONTIER_NO_BIAS;
-  }
-
-  heading_cdeg = Astar_CandidateHeadingCdeg(start_x, start_y, goal_x, goal_y);
-  for (i = 0U; i < preferred_heading_count; ++i)
-  {
-    int32_t error = Astar_Abs32(Astar_SignedHeadingErrorCdeg(preferred_headings_cdeg[i], heading_cdeg));
-    if (error < best_error)
-    {
-      best_error = error;
-      best_index = i;
-    }
-  }
-
-  return best_index;
+  return distance < other_distance;
 }
 
-static int32_t Astar_CandidateHeadingCdeg(uint8_t start_x, uint8_t start_y, uint8_t goal_x, uint8_t goal_y)
-{
-  int16_t dx = (int16_t)goal_x - (int16_t)start_x;
-  int16_t dy = (int16_t)goal_y - (int16_t)start_y;
-  int16_t abs_dx = (dx < 0) ? (int16_t)(-dx) : dx;
-  int16_t abs_dy = (dy < 0) ? (int16_t)(-dy) : dy;
-
-  if (abs_dx >= abs_dy)
-  {
-    return (dx >= 0) ? 0L : 18000L;
-  }
-
-  return (dy < 0) ? 9000L : 27000L;
-}
-
-static bool Astar_CandidateBetter(uint8_t preference,
-                                  uint16_t distance,
-                                  uint8_t other_preference,
-                                  uint16_t other_distance)
-{
-  uint16_t score = Astar_CandidateScore(preference, distance);
-  uint16_t other_score = Astar_CandidateScore(other_preference, other_distance);
-
-  if (score != other_score)
-  {
-    return score < other_score;
-  }
-
-  if (distance != other_distance)
-  {
-    return distance < other_distance;
-  }
-
-  if (preference != other_preference)
-  {
-    return preference < other_preference;
-  }
-
-  return false;
-}
-
-static uint16_t Astar_CandidateScore(uint8_t preference, uint16_t distance)
-{
-  uint16_t score = (uint16_t)(distance * ASTAR_FRONTIER_DISTANCE_WEIGHT);
-
-  if (preference != ASTAR_FRONTIER_NO_BIAS)
-  {
-    score = (uint16_t)(score + (uint16_t)(preference * ASTAR_FRONTIER_HEADING_WEIGHT));
-  }
-
-  return score;
-}
-
-static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t preference, uint8_t *count)
+static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *count)
 {
   uint8_t pos;
 
@@ -474,9 +344,7 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t pre
   if (pos >= ASTAR_FRONTIER_CANDIDATE_LIMIT)
   {
     if (!Astar_CandidateBetter(
-            preference,
             distance,
-            s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_LIMIT - 1U].preference,
             s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_LIMIT - 1U].distance))
     {
       return;
@@ -490,9 +358,7 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t pre
 
   while ((pos > 0U) &&
          Astar_CandidateBetter(
-             preference,
              distance,
-             s_frontier_candidates[pos - 1U].preference,
              s_frontier_candidates[pos - 1U].distance))
   {
     s_frontier_candidates[pos] = s_frontier_candidates[pos - 1U];
@@ -501,7 +367,6 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t pre
 
   s_frontier_candidates[pos].index = index;
   s_frontier_candidates[pos].distance = distance;
-  s_frontier_candidates[pos].preference = preference;
 }
 
 static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
@@ -676,40 +541,4 @@ static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y)
   }
 
   return best_index;
-}
-
-static int32_t Astar_NormalizeHeadingCdeg(int32_t heading_cdeg)
-{
-  while (heading_cdeg < 0L)
-  {
-    heading_cdeg += 36000L;
-  }
-
-  while (heading_cdeg >= 36000L)
-  {
-    heading_cdeg -= 36000L;
-  }
-
-  return heading_cdeg;
-}
-
-static int32_t Astar_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg)
-{
-  int32_t error = Astar_NormalizeHeadingCdeg(target_cdeg) - Astar_NormalizeHeadingCdeg(current_cdeg);
-
-  if (error > 18000L)
-  {
-    error -= 36000L;
-  }
-  else if (error < -18000L)
-  {
-    error += 36000L;
-  }
-
-  return error;
-}
-
-static int32_t Astar_Abs32(int32_t value)
-{
-  return (value < 0L) ? -value : value;
 }

@@ -31,6 +31,7 @@ typedef struct
 bool MotorControl_Init(void);
 void MotorControl_Stop(void);
 void MotorControl_SetForward(uint16_t duty_permille);
+void MotorControl_SetForwardSteer(uint16_t duty_permille, int32_t steering_permille);
 void MotorControl_SetTurnLeft(uint16_t duty_permille);
 void MotorControl_SetTurnRight(uint16_t duty_permille);
 void MotorControl_UpdateButtons(void);

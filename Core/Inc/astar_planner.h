@@ -37,12 +37,6 @@ AstarPlannerStatus_t AstarPlanner_PlanToFrontier(const MappingGridSnapshot_t *sn
                                                  uint8_t start_x,
                                                  uint8_t start_y,
                                                  AstarPlannerPath_t *out_path);
-AstarPlannerStatus_t AstarPlanner_PlanToFrontierBiased(const MappingGridSnapshot_t *snapshot,
-                                                       uint8_t start_x,
-                                                       uint8_t start_y,
-                                                       const int32_t *preferred_headings_cdeg,
-                                                       uint8_t preferred_heading_count,
-                                                       AstarPlannerPath_t *out_path);
 AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapshot,
                                              uint8_t start_x,
                                              uint8_t start_y,

@@ -361,6 +361,7 @@ static bool BluetoothControl_IsPriorityTxLine(const char *text)
          (strncmp(text, "ERR ", 4U) == 0) ||
          (strncmp(text, "EMERGENCY", 9U) == 0) ||
          (strncmp(text, "MOTOR ", 6U) == 0) ||
+         (strncmp(text, "MODE86 ", 7U) == 0) ||
          (strncmp(text, "SLAM STOP", 9U) == 0) ||
          (strncmp(text, "MAP STOP", 8U) == 0) ||
          (strncmp(text, "GYRO CAL", 8U) == 0) ||
@@ -375,6 +376,7 @@ static bool BluetoothControl_IsUrgentCommand(BluetoothCommandType_t command)
   return (command == BLUETOOTH_CMD_STOP_ALL) ||
          (command == BLUETOOTH_CMD_DRIVE_STOP) ||
          (command == BLUETOOTH_CMD_SLAM_NAV_OFF) ||
+         (command == BLUETOOTH_CMD_MODE86_OFF) ||
          (command == BLUETOOTH_CMD_AUTO_MAPPING_OFF) ||
          (command == BLUETOOTH_CMD_STOP_MAPPING);
 }
@@ -433,6 +435,8 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_ENCODER_CAL_END: return "ENCODER_CAL_END";
     case BLUETOOTH_CMD_AUTO_MAPPING_ON: return "AUTO_MAPPING_ON";
     case BLUETOOTH_CMD_AUTO_MAPPING_OFF:return "AUTO_MAPPING_OFF";
+    case BLUETOOTH_CMD_MODE86_ON:       return "MODE86_ON";
+    case BLUETOOTH_CMD_MODE86_OFF:      return "MODE86_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_ON:     return "SLAM_NAV_ON";
     case BLUETOOTH_CMD_SLAM_NAV_OFF:    return "SLAM_NAV_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_RETURN: return "SLAM_NAV_RETURN";
@@ -811,6 +815,26 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_AUTO_MAPPING_OFF;
   }
 
+  if ((strcmp(line, "86") == 0) ||
+      (strcmp(line, "86 ON") == 0) ||
+      (strcmp(line, "MODE86") == 0) ||
+      (strcmp(line, "MODE86 ON") == 0) ||
+      (strcmp(line, "MODE 86") == 0) ||
+      (strcmp(line, "MODE 86 ON") == 0) ||
+      (strcmp(line, "AVOID SLAM") == 0) ||
+      (strcmp(line, "AVOID SLAM ON") == 0))
+  {
+    return BLUETOOTH_CMD_MODE86_ON;
+  }
+
+  if ((strcmp(line, "86 OFF") == 0) ||
+      (strcmp(line, "MODE86 OFF") == 0) ||
+      (strcmp(line, "MODE 86 OFF") == 0) ||
+      (strcmp(line, "AVOID SLAM OFF") == 0))
+  {
+    return BLUETOOTH_CMD_MODE86_OFF;
+  }
+
   if ((strcmp(line, "98") == 0) ||
       (strcmp(line, "SLAM") == 0) ||
       (strcmp(line, "SLAM ON") == 0) ||
@@ -986,6 +1010,7 @@ static void BluetoothControl_ApplyCommand(BluetoothCommandType_t command)
   s_state.last_command = command;
 
   if ((command == BLUETOOTH_CMD_START_MAPPING) ||
+      (command == BLUETOOTH_CMD_MODE86_ON) ||
       (command == BLUETOOTH_CMD_SLAM_NAV_ON) ||
       (command == BLUETOOTH_CMD_SLAM_NAV_RETURN))
   {
@@ -993,6 +1018,7 @@ static void BluetoothControl_ApplyCommand(BluetoothCommandType_t command)
   }
   else if ((command == BLUETOOTH_CMD_STOP_MAPPING) ||
            (command == BLUETOOTH_CMD_STOP_ALL) ||
+           (command == BLUETOOTH_CMD_MODE86_OFF) ||
            (command == BLUETOOTH_CMD_SLAM_NAV_OFF))
   {
     s_state.mapping_active = false;
