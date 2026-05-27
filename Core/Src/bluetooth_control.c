@@ -66,6 +66,7 @@ static bool s_initialized;
 static uint32_t s_last_rx_retry_tick_ms;
 static uint32_t s_last_bt_map_row_tick_ms;
 static uint32_t s_last_bt_pose_tick_ms;
+static bool s_safe_set_capture_active;
 
 static bool BluetoothControl_StartReceive(void);
 static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context);
@@ -89,6 +90,8 @@ static void BluetoothControl_SendAck(BluetoothCommandType_t command);
 static void BluetoothControl_QueueLineFromIsr(const char *text, BaseType_t *higher_priority_task_woken);
 static bool BluetoothControl_IsLineBreak(uint8_t byte);
 static bool BluetoothControl_IsPrintable(uint8_t byte);
+static bool BluetoothControl_IsUnsignedNumber(const char *line);
+static bool BluetoothControl_IsSafeValueLine(const char *line);
 static bool BluetoothControl_IsTurnDegreeCommand(const char *line, char prefix);
 static char BluetoothControl_ToUpper(char c);
 
@@ -100,6 +103,7 @@ bool BluetoothControl_Init(void)
   }
 
   memset(&s_state, 0, sizeof(s_state));
+  s_safe_set_capture_active = false;
 
   s_rx_line_queue = xQueueCreateStatic(
       BLUETOOTH_RX_LINE_QUEUE_LENGTH,
@@ -430,6 +434,9 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_LIDAR_DEBUG_ON:  return "LIDAR_DEBUG_ON";
     case BLUETOOTH_CMD_LIDAR_DEBUG_OFF: return "LIDAR_DEBUG_OFF";
     case BLUETOOTH_CMD_LIDAR_QUALITY_SET:return "LIDAR_QUALITY_SET";
+    case BLUETOOTH_CMD_SAFE_SET:        return "SAFE_SET";
+    case BLUETOOTH_CMD_SAFE_VALUE:      return "SAFE_VALUE";
+    case BLUETOOTH_CMD_SAFE_END:        return "SAFE_END";
     case BLUETOOTH_CMD_ODOM_DEBUG_ON:   return "ODOM_DEBUG_ON";
     case BLUETOOTH_CMD_ODOM_DEBUG_OFF:  return "ODOM_DEBUG_OFF";
     case BLUETOOTH_CMD_ENCODER_CAL_END: return "ENCODER_CAL_END";
@@ -661,6 +668,13 @@ static void BluetoothControl_ProcessLine(const BluetoothLine_t *line)
     return;
   }
 
+  if ((command != BLUETOOTH_CMD_SAFE_SET) &&
+      (command != BLUETOOTH_CMD_SAFE_VALUE) &&
+      (command != BLUETOOTH_CMD_SAFE_END))
+  {
+    s_safe_set_capture_active = false;
+  }
+
   BluetoothControl_ApplyCommand(command);
   BluetoothControl_QueueCommand(command, normalized, line->tick_ms);
   BluetoothControl_SendAck(command);
@@ -668,6 +682,34 @@ static void BluetoothControl_ProcessLine(const BluetoothLine_t *line)
 
 static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
 {
+  if ((strcmp(line, "SAFE SET") == 0) ||
+      (strcmp(line, "SET SAFE") == 0))
+  {
+    s_safe_set_capture_active = true;
+    return BLUETOOTH_CMD_SAFE_SET;
+  }
+
+  if ((strcmp(line, "SAFE END") == 0) ||
+      (strcmp(line, "END SAFE") == 0))
+  {
+    s_safe_set_capture_active = false;
+    return BLUETOOTH_CMD_SAFE_END;
+  }
+
+  if (s_safe_set_capture_active && BluetoothControl_IsUnsignedNumber(line))
+  {
+    if (strcmp(line, "0") == 0)
+    {
+      return BLUETOOTH_CMD_DRIVE_STOP;
+    }
+    return BLUETOOTH_CMD_SAFE_VALUE;
+  }
+
+  if ((strncmp(line, "SAFE ", 5U) == 0) && BluetoothControl_IsSafeValueLine(line))
+  {
+    return BLUETOOTH_CMD_SAFE_VALUE;
+  }
+
   if (strcmp(line, "91") == 0)
   {
     return BLUETOOTH_CMD_START_MAPPING;
@@ -1124,6 +1166,52 @@ static bool BluetoothControl_IsLineBreak(uint8_t byte)
 static bool BluetoothControl_IsPrintable(uint8_t byte)
 {
   return ((byte >= 0x20U) && (byte <= 0x7EU));
+}
+
+static bool BluetoothControl_IsUnsignedNumber(const char *line)
+{
+  if ((line == NULL) || (line[0] == '\0'))
+  {
+    return false;
+  }
+
+  while (*line != '\0')
+  {
+    if ((*line < '0') || (*line > '9'))
+    {
+      return false;
+    }
+    line++;
+  }
+
+  return true;
+}
+
+static bool BluetoothControl_IsSafeValueLine(const char *line)
+{
+  const char *text = line;
+
+  if (line == NULL)
+  {
+    return false;
+  }
+
+  if (strncmp(text, "SAFE ", 5U) == 0)
+  {
+    text = &text[5];
+  }
+
+  if (strncmp(text, "VALUE ", 6U) == 0)
+  {
+    text = &text[6];
+  }
+
+  while (*text == ' ')
+  {
+    text++;
+  }
+
+  return BluetoothControl_IsUnsignedNumber(text);
 }
 
 static bool BluetoothControl_IsTurnDegreeCommand(const char *line, char prefix)

@@ -76,6 +76,7 @@
 #define AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
 #define AUTO_MAPPING_MIN_SAFE_MM    50U
 #define AUTO_MAPPING_MAX_SAFE_MM    2000U
+#define OBSTACLE_SAFE_DEFAULT_MM    350U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
@@ -103,8 +104,10 @@
 #define MODE86_OBSERVE_SECTOR_CDEG 3000U
 #define MODE86_FRONT_BLOCK_HOLD_MS 400U
 #define MODE86_AVG_DISTANCE_NEAR_MM 100U
-#define MODE86_TURN_SIDE_CLEARANCE_MM 320U
-#define MODE86_TURN_DIAGONAL_CLEARANCE_MM 420U
+#define MODE86_TURN_SIDE_SOFT_CLEARANCE_MM 320U
+#define MODE86_TURN_DIAGONAL_SOFT_CLEARANCE_MM 420U
+#define MODE86_TURN_RISK_QUALITY_DIVISOR 16U
+#define MODE86_QUALITY_LEVEL_UNIT 500U
 #define MODE86_HEADING_HOLD_DEADBAND_CDEG 150L
 #define MODE86_HEADING_HOLD_CDEG_PER_PWM  40L
 #define MODE86_HEADING_HOLD_MAX_STEER     70L
@@ -214,6 +217,8 @@ typedef enum
 typedef struct
 {
   uint32_t sum_mm;
+  uint64_t weighted_sum_mm;
+  uint32_t quality_sum;
   uint16_t count;
   uint16_t min_mm;
 } mode86_sector_stats_t;
@@ -238,7 +243,10 @@ static uint32_t last_map_stat_tx_tick_ms = 0U;
 static uint32_t last_pose_tx_tick_ms = 0U;
 static uint32_t last_mapping_pose_tick_ms = 0U;
 static uint32_t mapping_start_tick_ms = 0U;
-static uint16_t obstacle_safe_distance_mm = AUTO_MAPPING_MIN_SAFE_MM;
+static uint16_t obstacle_safe_distance_mm = OBSTACLE_SAFE_DEFAULT_MM;
+static bool obstacle_safe_set_active = false;
+static bool obstacle_safe_pending_valid = false;
+static uint16_t obstacle_safe_pending_mm = OBSTACLE_SAFE_DEFAULT_MM;
 
 static bool lidar_result_valid = false;
 static bool mapping_active = false;
@@ -393,14 +401,20 @@ static void TestApp_Mode86StartStop(const char *reason, uint32_t now_ms);
 static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms);
 static void TestApp_Mode86DecideAndAct(uint32_t now_ms);
 static void TestApp_ResetMode86SectorStats(void);
-static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm);
+static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm, uint8_t quality);
 static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats);
-static uint16_t TestApp_Mode86SectorCountLevel(const mode86_sector_stats_t *stats);
-static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
-                                       const mode86_sector_stats_t *current_best);
-static bool TestApp_Mode86SectorMinClear(const mode86_sector_stats_t *stats, uint16_t clearance_mm);
-static bool TestApp_Mode86TurnSweepClear(int8_t direction);
-static void TestApp_Mode86SendStats(uint16_t safe_mm, bool right_turn_clear, bool left_turn_clear);
+static uint16_t TestApp_Mode86SectorAverageQuality(const mode86_sector_stats_t *stats);
+static uint16_t TestApp_Mode86SectorEvidenceLevel(const mode86_sector_stats_t *stats);
+static int32_t TestApp_Mode86TurnScore(int8_t direction);
+static int32_t TestApp_Mode86SoftRiskPenalty(const mode86_sector_stats_t *stats, uint16_t soft_clearance_mm);
+static bool TestApp_Mode86ScoreBetter(int32_t candidate_score,
+                                      const mode86_sector_stats_t *candidate,
+                                      int32_t current_score,
+                                      const mode86_sector_stats_t *current_best);
+static void TestApp_Mode86SendStats(uint16_t safe_mm,
+                                    int32_t front_score,
+                                    int32_t right_score,
+                                    int32_t left_score);
 static bool TestApp_Mode86StepReached(void);
 static bool TestApp_Mode86FrontBlocked(uint32_t now_ms);
 static int32_t TestApp_Mode86HeadingHoldSteer(int32_t error_cdeg);
@@ -424,6 +438,12 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms);
 static int32_t TestApp_IntegrateAngleTurnDeltaCdeg(uint32_t delta_ms);
 static uint16_t TestApp_ParseTurnDegrees(const char *text);
 static uint8_t TestApp_ParseLidarQuality(const char *text, uint8_t fallback);
+static bool TestApp_ParseObstacleSafeDistance(const char *text, uint16_t *out_distance_mm);
+static void TestApp_StartObstacleSafeDistanceSet(void);
+static void TestApp_SetObstacleSafeDistancePending(const char *text);
+static void TestApp_EndObstacleSafeDistanceSet(void);
+static void TestApp_CancelObstacleSafeDistanceSet(const char *reason);
+static bool TestApp_IsObstacleSafeCommand(BluetoothCommandType_t command);
 static int32_t TestApp_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t TestApp_SnapHeadingToMazeAxis(int32_t heading_cdeg);
 static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t requested_degrees);
@@ -436,10 +456,9 @@ static void TestApp_SendMapStat(void);
 static void TestApp_SendMpuState(void);
 static void TestApp_ResetMapNorth(void);
 static void TestApp_SendDirState(void);
+static void TestApp_FormatEncoderTelemetry(char *buffer, size_t buffer_size);
 static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
-static uint16_t AdcToSafeDistanceMm(uint16_t adc_value);
-static void TestApp_LatchObstacleSafeDistance(void);
 static uint16_t GetObstacleSafeDistanceMm(void);
 static uint16_t GetAutoFrontBlockDistanceMm(void);
 static uint16_t GetMode86SafeDistanceMm(void);
@@ -772,23 +791,6 @@ static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value)
   return (value > max_value) ? max_value : value;
 }
 
-static uint16_t AdcToSafeDistanceMm(uint16_t adc_value)
-{
-  uint32_t span = (uint32_t)(AUTO_MAPPING_MAX_SAFE_MM - AUTO_MAPPING_MIN_SAFE_MM);
-
-  if (adc_value > 4095U)
-  {
-    adc_value = 4095U;
-  }
-
-  return (uint16_t)(AUTO_MAPPING_MIN_SAFE_MM + (((uint32_t)adc_value * span) / 4095U));
-}
-
-static void TestApp_LatchObstacleSafeDistance(void)
-{
-  obstacle_safe_distance_mm = AdcToSafeDistanceMm(adc_buf[2]);
-}
-
 static uint16_t GetObstacleSafeDistanceMm(void)
 {
   return obstacle_safe_distance_mm;
@@ -833,6 +835,23 @@ static int32_t NormalizeHeadingCdeg(int32_t heading_cdeg)
 static int32_t AppAbs32(int32_t value)
 {
   return (value < 0L) ? -value : value;
+}
+
+static void TestApp_FormatEncoderTelemetry(char *buffer, size_t buffer_size)
+{
+  if ((buffer == NULL) || (buffer_size == 0U))
+  {
+    return;
+  }
+
+  (void)snprintf(
+      buffer,
+      buffer_size,
+      " lc=%ld rc=%ld ld=%d rd=%d",
+      (long)encoder_test.left_total,
+      (long)encoder_test.right_total,
+      (int)encoder_test.left_delta,
+      (int)encoder_test.right_delta);
 }
 
 static void TestApp_UpdateGyroDriftCompensation(int16_t left_delta, int16_t right_delta)
@@ -1020,7 +1039,7 @@ static void RenderPage_ADC(void)
   DrawStatusLine(4U, "FWD", (int32_t)GetDrivePwmPermille());
   DrawStatusLine(5U, "TURN", (int32_t)GetTurnPwmPermille());
   DrawStatusLine(6U, "SAFE", (int32_t)GetObstacleSafeDistanceMm());
-  OLED_DrawString6x8(0U, 7U, "P1FWD P2TURN P3SAFE");
+  OLED_DrawString6x8(0U, 7U, "P3RAW SAFE=BT");
 }
 
 static void RenderPage_Encoder(void)
@@ -1166,7 +1185,6 @@ static void TestApp_InitPeripherals(void)
   (void)Mpu6500_GetState(&mpu_state);
   (void)BluetoothControl_Init();
   MappingGrid_Init();
-  TestApp_LatchObstacleSafeDistance();
   (void)SlamNav_Init();
   if (!LidarPipeline_Init())
   {
@@ -1180,8 +1198,25 @@ static void TestApp_HandleBluetoothCommands(void)
 
   while (BluetoothControl_TakeCommand(&command))
   {
+    if (!TestApp_IsObstacleSafeCommand(command.type))
+    {
+      TestApp_CancelObstacleSafeDistanceSet("CMD");
+    }
+
     switch (command.type)
     {
+      case BLUETOOTH_CMD_SAFE_SET:
+        TestApp_StartObstacleSafeDistanceSet();
+        break;
+
+      case BLUETOOTH_CMD_SAFE_VALUE:
+        TestApp_SetObstacleSafeDistancePending(command.text);
+        break;
+
+      case BLUETOOTH_CMD_SAFE_END:
+        TestApp_EndObstacleSafeDistanceSet();
+        break;
+
       case BLUETOOTH_CMD_DRIVE_FORWARD:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
@@ -1285,10 +1320,21 @@ static void TestApp_HandleBluetoothCommands(void)
         break;
 
       case BLUETOOTH_CMD_AUTO_MAPPING_OFF:
+      {
+        char line[96];
+        char enc[64];
+
         SlamNav_Stop();
         TestApp_StopAutoMapping();
-        (void)BluetoothControl_SendText("AUTO MAP STOP\r\n");
+        TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
+        (void)snprintf(
+            line,
+            sizeof(line),
+            "AUTO MAP STOP%s\r\n",
+            enc);
+        (void)BluetoothControl_SendText(line);
         break;
+      }
 
       case BLUETOOTH_CMD_MODE86_ON:
         SlamNav_Stop();
@@ -1582,7 +1628,8 @@ static void TestApp_SendLidarFrontState(void)
   bool data_valid;
   bool direct_blocked;
   bool auto_blocked;
-  char line[192];
+  char line[256];
+  char enc[64];
 
   if (lidar_front_current.scan_seq >= stats.scan_seq)
   {
@@ -1599,11 +1646,12 @@ static void TestApp_SendLidarFrontState(void)
       (age_ms <= LIDAR_FRONT_STATE_MAX_AGE_MS));
   direct_blocked = data_valid && (stats.min_distance_mm <= block_mm);
   auto_blocked = TestApp_IsAutoFrontBlocked(now);
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
 
   (void)snprintf(
       line,
       sizeof(line),
-      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u block=%u sector=%u body=%u blocked=%u auto=%u\r\n",
+      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u block=%u sector=%u body=%u blocked=%u auto=%u%s\r\n",
       (unsigned long)stats.scan_seq,
       (unsigned int)stats.point_count,
       (unsigned int)stats.min_distance_mm,
@@ -1616,7 +1664,8 @@ static void TestApp_SendLidarFrontState(void)
       (unsigned int)AUTO_MAPPING_FRONT_SECTOR_CDEG,
       (unsigned int)AUTO_MAPPING_FRONT_BODY_OFFSET_MM,
       (unsigned int)direct_blocked,
-      (unsigned int)auto_blocked);
+      (unsigned int)auto_blocked,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -2043,6 +2092,171 @@ static uint8_t TestApp_ParseLidarQuality(const char *text, uint8_t fallback)
   return has_digit ? (uint8_t)value : fallback;
 }
 
+static bool TestApp_ParseObstacleSafeDistance(const char *text, uint16_t *out_distance_mm)
+{
+  uint32_t value = 0U;
+  bool has_digit = false;
+
+  if ((text == NULL) || (out_distance_mm == NULL))
+  {
+    return false;
+  }
+
+  while (*text != '\0')
+  {
+    if ((*text >= '0') && (*text <= '9'))
+    {
+      has_digit = true;
+      value = (value * 10U) + (uint32_t)(*text - '0');
+      if (value > (uint32_t)AUTO_MAPPING_MAX_SAFE_MM)
+      {
+        break;
+      }
+    }
+    text++;
+  }
+
+  if (!has_digit ||
+      (value < (uint32_t)AUTO_MAPPING_MIN_SAFE_MM) ||
+      (value > (uint32_t)AUTO_MAPPING_MAX_SAFE_MM))
+  {
+    return false;
+  }
+
+  *out_distance_mm = (uint16_t)value;
+  return true;
+}
+
+static void TestApp_StartObstacleSafeDistanceSet(void)
+{
+  char line[96];
+
+  obstacle_safe_set_active = true;
+  obstacle_safe_pending_valid = false;
+  obstacle_safe_pending_mm = GetObstacleSafeDistanceMm();
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "SAFE SET START range=%u..%u current=%u\r\n",
+      (unsigned int)AUTO_MAPPING_MIN_SAFE_MM,
+      (unsigned int)AUTO_MAPPING_MAX_SAFE_MM,
+      (unsigned int)GetObstacleSafeDistanceMm());
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_SetObstacleSafeDistancePending(const char *text)
+{
+  uint16_t safe_mm;
+  char line[96];
+
+  if (!obstacle_safe_set_active)
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "SAFE VALUE ERR inactive current=%u\r\n",
+        (unsigned int)GetObstacleSafeDistanceMm());
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  if (!TestApp_ParseObstacleSafeDistance(text, &safe_mm))
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "SAFE VALUE ERR range=%u..%u current=%u\r\n",
+        (unsigned int)AUTO_MAPPING_MIN_SAFE_MM,
+        (unsigned int)AUTO_MAPPING_MAX_SAFE_MM,
+        (unsigned int)GetObstacleSafeDistanceMm());
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  obstacle_safe_pending_mm = safe_mm;
+  obstacle_safe_pending_valid = true;
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "SAFE VALUE pending=%u current=%u\r\n",
+      (unsigned int)obstacle_safe_pending_mm,
+      (unsigned int)GetObstacleSafeDistanceMm());
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_EndObstacleSafeDistanceSet(void)
+{
+  char line[96];
+
+  if (!obstacle_safe_set_active)
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "SAFE SET ERR inactive current=%u\r\n",
+        (unsigned int)GetObstacleSafeDistanceMm());
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  if (!obstacle_safe_pending_valid)
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "SAFE SET ERR no_value current=%u range=%u..%u\r\n",
+        (unsigned int)GetObstacleSafeDistanceMm(),
+        (unsigned int)AUTO_MAPPING_MIN_SAFE_MM,
+        (unsigned int)AUTO_MAPPING_MAX_SAFE_MM);
+    (void)BluetoothControl_SendText(line);
+    obstacle_safe_set_active = false;
+    return;
+  }
+
+  obstacle_safe_distance_mm = obstacle_safe_pending_mm;
+  obstacle_safe_set_active = false;
+  obstacle_safe_pending_valid = false;
+  SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "SAFE SET OK safe=%u source=BT range=%u..%u\r\n",
+      (unsigned int)GetObstacleSafeDistanceMm(),
+      (unsigned int)AUTO_MAPPING_MIN_SAFE_MM,
+      (unsigned int)AUTO_MAPPING_MAX_SAFE_MM);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_CancelObstacleSafeDistanceSet(const char *reason)
+{
+  char line[80];
+
+  if (!obstacle_safe_set_active)
+  {
+    return;
+  }
+
+  obstacle_safe_set_active = false;
+  obstacle_safe_pending_valid = false;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "SAFE SET CANCEL reason=%s current=%u\r\n",
+      (reason != NULL) ? reason : "CMD",
+      (unsigned int)GetObstacleSafeDistanceMm());
+  (void)BluetoothControl_SendText(line);
+}
+
+static bool TestApp_IsObstacleSafeCommand(BluetoothCommandType_t command)
+{
+  return (command == BLUETOOTH_CMD_SAFE_SET) ||
+      (command == BLUETOOTH_CMD_SAFE_VALUE) ||
+      (command == BLUETOOTH_CMD_SAFE_END);
+}
+
 static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
 {
   char line[80];
@@ -2324,6 +2538,9 @@ static int32_t TestApp_IntegrateAngleTurnDeltaCdeg(uint32_t delta_ms)
 
 static void TestApp_StartAutoMapping(void)
 {
+  char line[128];
+  char enc[64];
+
   auto_mapping_active = true;
   TestApp_ResetAutoMappingSectorMins();
   last_auto_mapping_control_tick_ms = 0U;
@@ -2340,7 +2557,13 @@ static void TestApp_StartAutoMapping(void)
   auto_mapping_observe_after_resume = false;
 
   TestApp_StartAutoObservation("START");
-  (void)BluetoothControl_SendText("AUTO WALL START rule=right-hand\r\n");
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "AUTO WALL START rule=right-hand%s\r\n",
+      enc);
+  (void)BluetoothControl_SendText(line);
 }
 
 static void TestApp_StopAutoMapping(void)
@@ -2369,7 +2592,8 @@ static void TestApp_StopAutoMapping(void)
 static void TestApp_StartMode86(void)
 {
   uint32_t now = HAL_GetTick();
-  char line[128];
+  char line[192];
+  char enc[64];
 
   mode86_active = true;
   mode86_state = MODE86_STATE_IDLE;
@@ -2385,15 +2609,17 @@ static void TestApp_StartMode86(void)
 
   TestApp_StartMapping();
   mode86_target_heading_cdeg = TestApp_SnapHeadingToMazeAxis(mapping_pose.heading_cdeg);
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
 
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 START step=%ld stop=%u safe=%u heading=%ld\r\n",
+      "MODE86 START step=%ld stop=%u safe=%u heading=%ld%s\r\n",
       (long)MODE86_STEP_DISTANCE_MM,
       (unsigned int)MODE86_STOP_MS,
       (unsigned int)GetMode86SafeDistanceMm(),
-      (long)mode86_target_heading_cdeg);
+      (long)mode86_target_heading_cdeg,
+      enc);
   (void)BluetoothControl_SendText(line);
 
   TestApp_Mode86StartDrive("START", now);
@@ -2401,6 +2627,9 @@ static void TestApp_StartMode86(void)
 
 static void TestApp_StopMode86(void)
 {
+  char line[96];
+  char enc[64];
+
   if (!mode86_active)
   {
     return;
@@ -2420,7 +2649,13 @@ static void TestApp_StopMode86(void)
     TestApp_StopAngleTurn(false);
   }
   MotorControl_Stop();
-  (void)BluetoothControl_SendText("MODE86 STOP\r\n");
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 STOP%s\r\n",
+      enc);
+  (void)BluetoothControl_SendText(line);
 }
 
 static void TestApp_UpdateMode86(uint32_t now_ms)
@@ -2474,8 +2709,9 @@ static void TestApp_UpdateMode86(uint32_t now_ms)
   switch (mode86_state)
   {
     case MODE86_STATE_DRIVE:
-      if (!mode86_post_turn_drive_active && TestApp_Mode86FrontBlocked(now_ms))
+      if (TestApp_Mode86FrontBlocked(now_ms))
       {
+        mode86_post_turn_drive_active = false;
         TestApp_Mode86StartStop("FRONT_BLOCKED", now_ms);
         return;
       }
@@ -2545,15 +2781,11 @@ static void TestApp_UpdateMode86Obstacle(const LidarPoint_t *point)
       return;
     }
 
-    if (mode86_post_turn_drive_active)
-    {
-      return;
-    }
-
     if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
         (clearance_mm <= GetMode86SafeDistanceMm()))
     {
       mode86_front_blocked_until_ms = HAL_GetTick() + MODE86_FRONT_BLOCK_HOLD_MS;
+      mode86_post_turn_drive_active = false;
       MotorControl_Stop();
     }
     return;
@@ -2577,38 +2809,39 @@ static void TestApp_UpdateMode86Obstacle(const LidarPoint_t *point)
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, 0U, MODE86_OBSERVE_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_front_stats, clearance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_front_stats, clearance_mm, point->quality);
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_right_stats, point->distance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_right_stats, point->distance_mm, point->quality);
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_left_stats, point->distance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_left_stats, point->distance_mm, point->quality);
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_BACK_CENTER_CDEG, MODE86_OBSERVE_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_back_stats, point->distance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_back_stats, point->distance_mm, point->quality);
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_front_right_stats, clearance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_front_right_stats, clearance_mm, point->quality);
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG))
   {
-    TestApp_Mode86AddSectorSample(&mode86_front_left_stats, clearance_mm);
+    TestApp_Mode86AddSectorSample(&mode86_front_left_stats, clearance_mm, point->quality);
   }
 }
 
 static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
 {
-  char line[160];
+  char line[224];
+  char enc[64];
 
   mode86_state = MODE86_STATE_DRIVE;
   mode86_state_until_ms = 0U;
@@ -2626,17 +2859,19 @@ static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
     reason = "DRIVE";
   }
 
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 DRIVE reason=%s cycle=%lu pose=%ld,%ld heading=%ld target=%ld post=%u\r\n",
+      "MODE86 DRIVE reason=%s cycle=%lu pose=%ld,%ld heading=%ld target=%ld post=%u%s\r\n",
       reason,
       (unsigned long)mode86_cycle_count,
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
       (long)mapping_pose.heading_cdeg,
       (long)mode86_target_heading_cdeg,
-      (unsigned int)mode86_post_turn_drive_active);
+      (unsigned int)mode86_post_turn_drive_active,
+      enc);
   (void)BluetoothControl_SendText(line);
 
   last_mode86_control_tick_ms = (now_ms >= MODE86_CONTROL_INTERVAL_MS) ?
@@ -2646,7 +2881,8 @@ static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
 
 static void TestApp_Mode86StartStop(const char *reason, uint32_t now_ms)
 {
-  char line[160];
+  char line[224];
+  char enc[64];
 
   MotorControl_Stop();
   mode86_state = MODE86_STATE_STOP;
@@ -2660,22 +2896,25 @@ static void TestApp_Mode86StartStop(const char *reason, uint32_t now_ms)
     reason = "STOP";
   }
 
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 STOPPING reason=%s state=%s pose=%ld,%ld heading=%ld wait=%u\r\n",
+      "MODE86 STOPPING reason=%s state=%s pose=%ld,%ld heading=%ld wait=%u%s\r\n",
       reason,
       TestApp_Mode86StateName(mode86_state),
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
       (long)mapping_pose.heading_cdeg,
-      (unsigned int)MODE86_STOP_MS);
+      (unsigned int)MODE86_STOP_MS,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
 static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms)
 {
-  char line[128];
+  char line[192];
+  char enc[64];
 
   MotorControl_Stop();
   mode86_state = MODE86_STATE_OBSERVE;
@@ -2689,13 +2928,15 @@ static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms)
     reason = "OBSERVE";
   }
 
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 OBSERVE reason=%s scans=%u timeout=%u\r\n",
+      "MODE86 OBSERVE reason=%s scans=%u timeout=%u%s\r\n",
       reason,
       (unsigned int)MODE86_OBSERVE_SCAN_STARTS,
-      (unsigned int)MODE86_OBSERVE_TIMEOUT_MS);
+      (unsigned int)MODE86_OBSERVE_TIMEOUT_MS,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -2704,13 +2945,10 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   const mode86_sector_stats_t *best_stats = &mode86_front_stats;
   uint16_t safe_mm = GetMode86SafeDistanceMm();
   uint16_t front_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_front_stats);
-  uint16_t right_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_right_stats);
-  uint16_t left_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_left_stats);
-  bool right_turn_clear = TestApp_Mode86TurnSweepClear(1);
-  bool left_turn_clear = TestApp_Mode86TurnSweepClear(-1);
-  bool front_too_close = (mode86_front_stats.count > 0U) && (front_avg_mm < safe_mm);
-  bool right_too_close = (mode86_right_stats.count > 0U) && (right_avg_mm < safe_mm);
-  bool left_too_close = (mode86_left_stats.count > 0U) && (left_avg_mm < safe_mm);
+  int32_t front_score = (int32_t)front_avg_mm;
+  int32_t right_score = TestApp_Mode86TurnScore(1);
+  int32_t left_score = TestApp_Mode86TurnScore(-1);
+  int32_t best_score = front_score;
   const char *reason = "BEST_FRONT";
   char dir = 'F';
   int8_t turn_direction = 0;
@@ -2721,26 +2959,19 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
       (mode86_front_stats.count > 0U) &&
       (mode86_right_stats.count > 0U) &&
       (mode86_left_stats.count > 0U) &&
-      (front_avg_mm < safe_mm) &&
-      (right_avg_mm < safe_mm) &&
-      (left_avg_mm < safe_mm);
-  char line[224];
+      (front_score < (int32_t)safe_mm) &&
+      (right_score < (int32_t)safe_mm) &&
+      (left_score < (int32_t)safe_mm);
+  char line[256];
+  char enc[64];
 
   if (u_turn_required)
   {
     reason = "ALL_AVG_LT_SAFE";
   }
 
-  if (!u_turn_required &&
-      front_too_close &&
-      (!right_turn_clear || right_too_close) &&
-      (!left_turn_clear || left_too_close))
-  {
-    u_turn_required = true;
-    reason = "TURN_SWEEP_BLOCKED";
-  }
-
-  TestApp_Mode86SendStats(safe_mm, right_turn_clear, left_turn_clear);
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
+  TestApp_Mode86SendStats(safe_mm, front_score, right_score, left_score);
 
   if (u_turn_required)
   {
@@ -2750,18 +2981,18 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   }
   else
   {
-    if (right_turn_clear &&
-        TestApp_Mode86SectorBetter(&mode86_right_stats, best_stats))
+    if (TestApp_Mode86ScoreBetter(right_score, &mode86_right_stats, best_score, best_stats))
     {
       best_stats = &mode86_right_stats;
+      best_score = right_score;
       reason = "BEST_RIGHT";
       dir = 'R';
     }
 
-    if (left_turn_clear &&
-        TestApp_Mode86SectorBetter(&mode86_left_stats, best_stats))
+    if (TestApp_Mode86ScoreBetter(left_score, &mode86_left_stats, best_score, best_stats))
     {
       best_stats = &mode86_left_stats;
+      best_score = left_score;
       reason = "BEST_LEFT";
       dir = 'L';
     }
@@ -2783,10 +3014,11 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     (void)snprintf(
         line,
         sizeof(line),
-        "MODE86 DECIDE dir=F reason=%s safe=%u turns=%lu\r\n",
+        "MODE86 DECIDE dir=F reason=%s safe=%u turns=%lu%s\r\n",
         reason,
         (unsigned int)safe_mm,
-        (unsigned long)mode86_turn_count);
+        (unsigned long)mode86_turn_count,
+        enc);
     (void)BluetoothControl_SendText(line);
     TestApp_Mode86StartDrive(reason, now_ms);
     return;
@@ -2810,12 +3042,13 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld turns=%lu\r\n",
+      "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld turns=%lu%s\r\n",
       dir,
       reason,
       (unsigned int)safe_mm,
       (long)target_heading_cdeg,
-      (unsigned long)mode86_turn_count);
+      (unsigned long)mode86_turn_count,
+      enc);
   (void)BluetoothControl_SendText(line);
 
   TestApp_StartHeadingTurnFixed(turn_direction, turn_degrees, target_heading_cdeg, 0U, reason);
@@ -2824,26 +3057,38 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
 static void TestApp_ResetMode86SectorStats(void)
 {
   mode86_front_stats.sum_mm = 0U;
+  mode86_front_stats.weighted_sum_mm = 0ULL;
+  mode86_front_stats.quality_sum = 0U;
   mode86_front_stats.count = 0U;
   mode86_front_stats.min_mm = UINT16_MAX;
   mode86_right_stats.sum_mm = 0U;
+  mode86_right_stats.weighted_sum_mm = 0ULL;
+  mode86_right_stats.quality_sum = 0U;
   mode86_right_stats.count = 0U;
   mode86_right_stats.min_mm = UINT16_MAX;
   mode86_left_stats.sum_mm = 0U;
+  mode86_left_stats.weighted_sum_mm = 0ULL;
+  mode86_left_stats.quality_sum = 0U;
   mode86_left_stats.count = 0U;
   mode86_left_stats.min_mm = UINT16_MAX;
   mode86_back_stats.sum_mm = 0U;
+  mode86_back_stats.weighted_sum_mm = 0ULL;
+  mode86_back_stats.quality_sum = 0U;
   mode86_back_stats.count = 0U;
   mode86_back_stats.min_mm = UINT16_MAX;
   mode86_front_right_stats.sum_mm = 0U;
+  mode86_front_right_stats.weighted_sum_mm = 0ULL;
+  mode86_front_right_stats.quality_sum = 0U;
   mode86_front_right_stats.count = 0U;
   mode86_front_right_stats.min_mm = UINT16_MAX;
   mode86_front_left_stats.sum_mm = 0U;
+  mode86_front_left_stats.weighted_sum_mm = 0ULL;
+  mode86_front_left_stats.quality_sum = 0U;
   mode86_front_left_stats.count = 0U;
   mode86_front_left_stats.min_mm = UINT16_MAX;
 }
 
-static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm)
+static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm, uint8_t quality)
 {
   if ((stats == NULL) || (stats->count == UINT16_MAX))
   {
@@ -2851,6 +3096,8 @@ static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t
   }
 
   stats->sum_mm += distance_mm;
+  stats->weighted_sum_mm += ((uint64_t)distance_mm * (uint64_t)quality);
+  stats->quality_sum += quality;
   stats->count++;
   if (distance_mm < stats->min_mm)
   {
@@ -2867,80 +3114,129 @@ static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats
     return 0U;
   }
 
-  average_mm = stats->sum_mm / (uint32_t)stats->count;
+  if (stats->quality_sum > 0U)
+  {
+    average_mm = (uint32_t)(stats->weighted_sum_mm / (uint64_t)stats->quality_sum);
+  }
+  else
+  {
+    average_mm = stats->sum_mm / (uint32_t)stats->count;
+  }
   return (average_mm > UINT16_MAX) ? UINT16_MAX : (uint16_t)average_mm;
 }
 
-static uint16_t TestApp_Mode86SectorCountLevel(const mode86_sector_stats_t *stats)
+static uint16_t TestApp_Mode86SectorAverageQuality(const mode86_sector_stats_t *stats)
+{
+  if ((stats == NULL) || (stats->count == 0U))
+  {
+    return 0U;
+  }
+
+  return (uint16_t)(stats->quality_sum / (uint32_t)stats->count);
+}
+
+static uint16_t TestApp_Mode86SectorEvidenceLevel(const mode86_sector_stats_t *stats)
 {
   if (stats == NULL)
   {
     return 0U;
   }
 
-  return (uint16_t)(stats->count / 10U);
+  return (uint16_t)(stats->quality_sum / MODE86_QUALITY_LEVEL_UNIT);
 }
 
-static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
-                                       const mode86_sector_stats_t *current_best)
+static int32_t TestApp_Mode86SoftRiskPenalty(const mode86_sector_stats_t *stats, uint16_t soft_clearance_mm)
 {
-  uint16_t candidate_avg = TestApp_Mode86SectorAverageMm(candidate);
-  uint16_t best_avg = TestApp_Mode86SectorAverageMm(current_best);
-  uint16_t avg_delta =
-      (candidate_avg > best_avg) ?
-      (uint16_t)(candidate_avg - best_avg) :
-      (uint16_t)(best_avg - candidate_avg);
-  uint16_t candidate_level = TestApp_Mode86SectorCountLevel(candidate);
-  uint16_t best_level = TestApp_Mode86SectorCountLevel(current_best);
+  uint16_t avg_mm;
+  uint16_t avg_quality;
 
-  if (avg_delta > MODE86_AVG_DISTANCE_NEAR_MM)
+  if ((stats == NULL) || (stats->count == 0U))
   {
-    return candidate_avg > best_avg;
+    return 0L;
   }
 
+  avg_mm = TestApp_Mode86SectorAverageMm(stats);
+  if (avg_mm >= soft_clearance_mm)
+  {
+    return 0L;
+  }
+
+  avg_quality = TestApp_Mode86SectorAverageQuality(stats);
+  return (int32_t)((((uint32_t)(soft_clearance_mm - avg_mm)) * (uint32_t)avg_quality) /
+                   MODE86_TURN_RISK_QUALITY_DIVISOR);
+}
+
+static int32_t TestApp_Mode86TurnScore(int8_t direction)
+{
+  const mode86_sector_stats_t *side_stats;
+  const mode86_sector_stats_t *diagonal_stats;
+  int32_t score;
+
+  if (direction > 0)
+  {
+    side_stats = &mode86_right_stats;
+    diagonal_stats = &mode86_front_right_stats;
+  }
+  else if (direction < 0)
+  {
+    side_stats = &mode86_left_stats;
+    diagonal_stats = &mode86_front_left_stats;
+  }
+  else
+  {
+    return (int32_t)TestApp_Mode86SectorAverageMm(&mode86_front_stats);
+  }
+
+  score = (int32_t)TestApp_Mode86SectorAverageMm(side_stats);
+  score -= TestApp_Mode86SoftRiskPenalty(side_stats, MODE86_TURN_SIDE_SOFT_CLEARANCE_MM);
+  score -= TestApp_Mode86SoftRiskPenalty(diagonal_stats, MODE86_TURN_DIAGONAL_SOFT_CLEARANCE_MM);
+
+  return (score > 0L) ? score : 0L;
+}
+
+static bool TestApp_Mode86ScoreBetter(int32_t candidate_score,
+                                      const mode86_sector_stats_t *candidate,
+                                      int32_t current_score,
+                                      const mode86_sector_stats_t *current_best)
+{
+  int32_t score_delta = candidate_score - current_score;
+  uint16_t candidate_level;
+  uint16_t best_level;
+
+  if (score_delta < 0L)
+  {
+    score_delta = -score_delta;
+  }
+
+  if (score_delta > (int32_t)MODE86_AVG_DISTANCE_NEAR_MM)
+  {
+    return candidate_score > current_score;
+  }
+
+  candidate_level = TestApp_Mode86SectorEvidenceLevel(candidate);
+  best_level = TestApp_Mode86SectorEvidenceLevel(current_best);
   if (candidate_level != best_level)
   {
     return candidate_level > best_level;
   }
 
-  return candidate_avg > best_avg;
+  return candidate_score > current_score;
 }
 
-static bool TestApp_Mode86SectorMinClear(const mode86_sector_stats_t *stats, uint16_t clearance_mm)
-{
-  if ((stats == NULL) || (stats->count == 0U))
-  {
-    return true;
-  }
-
-  return stats->min_mm >= clearance_mm;
-}
-
-static bool TestApp_Mode86TurnSweepClear(int8_t direction)
-{
-  if (direction > 0)
-  {
-    return TestApp_Mode86SectorMinClear(&mode86_right_stats, MODE86_TURN_SIDE_CLEARANCE_MM) &&
-        TestApp_Mode86SectorMinClear(&mode86_front_right_stats, MODE86_TURN_DIAGONAL_CLEARANCE_MM);
-  }
-
-  if (direction < 0)
-  {
-    return TestApp_Mode86SectorMinClear(&mode86_left_stats, MODE86_TURN_SIDE_CLEARANCE_MM) &&
-        TestApp_Mode86SectorMinClear(&mode86_front_left_stats, MODE86_TURN_DIAGONAL_CLEARANCE_MM);
-  }
-
-  return true;
-}
-
-static void TestApp_Mode86SendStats(uint16_t safe_mm, bool right_turn_clear, bool left_turn_clear)
+static void TestApp_Mode86SendStats(uint16_t safe_mm,
+                                    int32_t front_score,
+                                    int32_t right_score,
+                                    int32_t left_score)
 {
   char line[256];
+  char enc[64];
+
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
 
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 STATS d=F,R,L,B avg=%u,%u,%u,%u cnt=%u,%u,%u,%u min=%u,%u,%u,%u diag=FR,FL dmin=%u,%u dcnt=%u,%u gate=%u,%u safe=%u\r\n",
+      "MODE86 STATS d=F,R,L,B avg=%u,%u,%u,%u cnt=%u,%u,%u,%u q=%u,%u,%u,%u diag=FR,FL davg=%u,%u dq=%u,%u score=%ld,%ld,%ld safe=%u%s\r\n",
       (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_front_stats),
       (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_right_stats),
       (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_left_stats),
@@ -2949,17 +3245,19 @@ static void TestApp_Mode86SendStats(uint16_t safe_mm, bool right_turn_clear, boo
       (unsigned int)mode86_right_stats.count,
       (unsigned int)mode86_left_stats.count,
       (unsigned int)mode86_back_stats.count,
-      (unsigned int)mode86_front_stats.min_mm,
-      (unsigned int)mode86_right_stats.min_mm,
-      (unsigned int)mode86_left_stats.min_mm,
-      (unsigned int)mode86_back_stats.min_mm,
-      (unsigned int)mode86_front_right_stats.min_mm,
-      (unsigned int)mode86_front_left_stats.min_mm,
-      (unsigned int)mode86_front_right_stats.count,
-      (unsigned int)mode86_front_left_stats.count,
-      (unsigned int)right_turn_clear,
-      (unsigned int)left_turn_clear,
-      (unsigned int)safe_mm);
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_front_stats),
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_right_stats),
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_left_stats),
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_back_stats),
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_front_right_stats),
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_front_left_stats),
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_front_right_stats),
+      (unsigned int)TestApp_Mode86SectorAverageQuality(&mode86_front_left_stats),
+      (long)front_score,
+      (long)right_score,
+      (long)left_score,
+      (unsigned int)safe_mm,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -3168,7 +3466,8 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
 
 static void TestApp_StartAutoObservation(const char *reason)
 {
-  char line[96];
+  char line[160];
+  char enc[64];
 
   TestApp_ResetAutoMappingSectorMins();
   auto_mapping_observe_scan_starts_remaining = AUTO_MAPPING_OBSERVE_SCAN_STARTS;
@@ -3180,12 +3479,14 @@ static void TestApp_StartAutoObservation(const char *reason)
     reason = "OBSERVE";
   }
 
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL OBSERVE %s scan_starts=%u\r\n",
+      "AUTO WALL OBSERVE %s scan_starts=%u%s\r\n",
       reason,
-      (unsigned int)AUTO_MAPPING_OBSERVE_SCAN_STARTS);
+      (unsigned int)AUTO_MAPPING_OBSERVE_SCAN_STARTS,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -3394,7 +3695,8 @@ static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t reque
 
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms)
 {
-  char line[224];
+  char line[256];
+  char enc[64];
   int32_t target_heading_cdeg;
   int32_t snapped_error_cdeg;
   uint16_t snapped_degrees;
@@ -3425,10 +3727,11 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
     reason = "TURN";
   }
 
+  TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u fl=%u wall=%u conf=%u count=%lu\r\n",
+      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u fl=%u wall=%u conf=%u count=%lu%s\r\n",
       reason,
       (direction < 0) ? 'L' : 'R',
       (unsigned int)degrees,
@@ -3444,7 +3747,8 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
       (unsigned int)auto_mapping_front_left_min_mm,
       (unsigned int)auto_mapping_right_wall_seen,
       (unsigned int)auto_mapping_right_branch_confirm_count,
-      (unsigned long)auto_mapping_avoid_count);
+      (unsigned long)auto_mapping_avoid_count,
+      enc);
   (void)BluetoothControl_SendText(line);
 }
 
