@@ -4,10 +4,12 @@
 
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
 #define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
-#define ASTAR_FRONTIER_HEADING_TIE_CELLS 2U
 #define ASTAR_FRONTIER_NO_BIAS 0xFFU
+#define ASTAR_FRONTIER_DISTANCE_WEIGHT 4U
+#define ASTAR_FRONTIER_HEADING_WEIGHT 1U
 #define ASTAR_OBSTACLE_INFLATION_CELLS 0
 #define ASTAR_FREE_STEP_COST 1U
+#define ASTAR_HEURISTIC_WEIGHT 3U
 #define ASTAR_NODE_FLAG_OPEN 0x01U
 #define ASTAR_NODE_FLAG_CLOSED 0x02U
 #define ASTAR_COST_INF 0xFFFFU
@@ -58,6 +60,7 @@ static bool Astar_CandidateBetter(uint8_t preference,
                                   uint16_t distance,
                                   uint8_t other_preference,
                                   uint16_t other_distance);
+static uint16_t Astar_CandidateScore(uint8_t preference, uint16_t distance);
 static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t preference, uint8_t *count);
 static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
@@ -425,23 +428,17 @@ static bool Astar_CandidateBetter(uint8_t preference,
                                   uint8_t other_preference,
                                   uint16_t other_distance)
 {
-  if ((preference != ASTAR_FRONTIER_NO_BIAS) ||
-      (other_preference != ASTAR_FRONTIER_NO_BIAS))
+  uint16_t score = Astar_CandidateScore(preference, distance);
+  uint16_t other_score = Astar_CandidateScore(other_preference, other_distance);
+
+  if (score != other_score)
   {
-    if (preference != other_preference)
-    {
-      return preference < other_preference;
-    }
+    return score < other_score;
   }
 
-  if ((distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < other_distance)
+  if (distance != other_distance)
   {
-    return true;
-  }
-
-  if ((other_distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < distance)
-  {
-    return false;
+    return distance < other_distance;
   }
 
   if (preference != other_preference)
@@ -449,7 +446,19 @@ static bool Astar_CandidateBetter(uint8_t preference,
     return preference < other_preference;
   }
 
-  return distance < other_distance;
+  return false;
+}
+
+static uint16_t Astar_CandidateScore(uint8_t preference, uint16_t distance)
+{
+  uint16_t score = (uint16_t)(distance * ASTAR_FRONTIER_DISTANCE_WEIGHT);
+
+  if (preference != ASTAR_FRONTIER_NO_BIAS)
+  {
+    score = (uint16_t)(score + (uint16_t)(preference * ASTAR_FRONTIER_HEADING_WEIGHT));
+  }
+
+  return score;
 }
 
 static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t preference, uint8_t *count)
@@ -648,11 +657,13 @@ static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y)
       uint8_t x;
       uint8_t y;
       uint16_t h;
+      uint16_t weighted_h;
       uint16_t f;
 
       Astar_Cell(i, &x, &y);
       h = Astar_Manhattan(x, y, goal_x, goal_y);
-      f = (uint16_t)(s_g_score[i] + h);
+      weighted_h = (uint16_t)(h * ASTAR_HEURISTIC_WEIGHT);
+      f = (uint16_t)(s_g_score[i] + weighted_h);
       if ((best_index == ASTAR_COST_INF) ||
           (f < best_f) ||
           ((f == best_f) && (h < best_h)))
