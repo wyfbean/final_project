@@ -29,7 +29,7 @@ extern UART_HandleTypeDef huart1;
 #define LIDAR_PROTOCOL_Q6_TO_CDEG_DENOMINATOR 64UL
 #define LIDAR_BODY_ANGLE_SIGN                 (-1L)
 #define LIDAR_BODY_YAW_OFFSET_CDEG            18000L
-#define LIDAR_DEFAULT_MIN_POINT_QUALITY       30U
+#define LIDAR_DEFAULT_MIN_POINT_QUALITY       5U
 #define LIDAR_MAX_POINT_QUALITY               63U
 #define LIDAR_DISTANCE_BIAS_MM                350U
 

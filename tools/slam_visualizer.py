@@ -31,8 +31,9 @@ except ImportError:  # pragma: no cover - live serial is optional for replay mod
 
 
 DEFAULT_BAUD = 921600
-GRID_W = 40
-GRID_H = 40
+DEFAULT_PORT = "COM6"
+GRID_W = 56
+GRID_H = 56
 CELL_MM = 175
 CANVAS_SIZE = 720
 LOG_LIMIT = 300
@@ -131,7 +132,7 @@ class Model:
     unknown_cells: int = GRID_W * GRID_H
     tx_drops: int = 0
     inserted_points: int = 0
-    lidar_quality_min: int = 30
+    lidar_quality_min: int = 5
     lidar_distance_bias_mm: int = 0
 
     def reset_grid(self, width: int = GRID_W, height: int = GRID_H, cell_mm: int = CELL_MM) -> None:
@@ -375,8 +376,8 @@ class SlamVisualizer(tk.Tk):
         self.events: queue.Queue[str] = queue.Queue()
         self.worker = SerialWorker(self.events)
         self.baud_var = tk.IntVar(value=baud)
-        self.lidar_quality_var = tk.IntVar(value=30)
-        self.port_var = tk.StringVar(value=port or "COM7")
+        self.lidar_quality_var = tk.IntVar(value=5)
+        self.port_var = tk.StringVar(value=port or DEFAULT_PORT)
         self.port_labels: List[str] = []
         self.status_vars = {
             "source": tk.StringVar(value="offline"),
@@ -628,7 +629,7 @@ class SlamVisualizer(tk.Tk):
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Visualize STM32 SLAM/A* serial output.")
-    parser.add_argument("--port", help="Bluetooth serial port, for example COM7")
+    parser.add_argument("--port", default=DEFAULT_PORT, help="Bluetooth serial port, for example COM6")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--replay", help="Replay a saved serial log instead of opening a live port")
     args = parser.parse_args(argv)

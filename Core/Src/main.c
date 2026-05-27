@@ -77,6 +77,8 @@
 #define AUTO_MAPPING_MIN_SAFE_MM    350U
 #define AUTO_MAPPING_MAX_SAFE_MM    3000U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
+#define AUTO_MAPPING_STEP_DISTANCE_MM 700L
+#define AUTO_MAPPING_SECTOR_CLEAR_MM 700U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
 #define AUTO_MAPPING_OPEN_MARGIN_MM 180U
@@ -108,6 +110,7 @@
 #define MAPPING_START_X_MM          (-1500L)
 #define MAPPING_START_Y_MM          (-1500L)
 #define MAPPING_START_HEADING_CDEG  9000L
+#define MAPPING_ROBOT_FREE_RADIUS_CELLS 2U
 #define MAPPING_POSE_HISTORY_LENGTH 64U
 #define MAPPING_LIDAR_POINT_MAX_AGE_MS 250U
 #define ENCODER_RIGHT_DELTA_SIGN    (-1L)
@@ -183,6 +186,14 @@ typedef struct
   uint8_t min_quality;
 } lidar_front_stats_t;
 
+typedef enum
+{
+  AUTO_MAPPING_STATE_IDLE = 0,
+  AUTO_MAPPING_STATE_DRIVE_STEP,
+  AUTO_MAPPING_STATE_OBSERVE,
+  AUTO_MAPPING_STATE_TURN
+} auto_mapping_state_t;
+
 static uint16_t adc_buf[ADC_CHANNEL_COUNT];
 static uint8_t oled_fb[OLED_FB_SIZE];
 static uint8_t oled_page_tx[OLED_WIDTH + 1U];
@@ -238,6 +249,7 @@ static uint16_t auto_mapping_front_blocking_angle_cdeg = 0U;
 static uint16_t auto_mapping_right_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_front_right_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_left_min_mm = UINT16_MAX;
+static uint16_t auto_mapping_front_left_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_right_best_distance_mm = 0U;
 static uint16_t auto_mapping_right_best_angle_cdeg = AUTO_MAPPING_RIGHT_CENTER_CDEG;
 static uint16_t auto_mapping_left_best_distance_mm = 0U;
@@ -258,6 +270,10 @@ static uint8_t auto_mapping_right_branch_confirm_count = 0U;
 static uint8_t auto_mapping_observe_scan_starts_remaining = 0U;
 static bool auto_mapping_right_wall_seen = false;
 static bool auto_mapping_observe_after_resume = false;
+static auto_mapping_state_t auto_mapping_state = AUTO_MAPPING_STATE_IDLE;
+static int32_t auto_mapping_step_start_left_counts = 0L;
+static int32_t auto_mapping_step_start_right_counts = 0L;
+static int32_t auto_mapping_step_travel_mm = 0L;
 static bool gyro_calibration_active = false;
 static uint32_t gyro_calibration_start_tick_ms = 0U;
 static int64_t gyro_calibration_sum_dps_x100 = 0;
@@ -325,6 +341,11 @@ static bool TestApp_IsFrontLidarPoint(uint16_t angle_cdeg);
 static bool TestApp_IsLidarAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, uint16_t half_width_cdeg);
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point);
 static void TestApp_StartAutoObservation(const char *reason);
+static void TestApp_AutoMappingStartDriveStep(const char *reason);
+static int32_t TestApp_AutoMappingGetStepTravelMm(void);
+static bool TestApp_AutoMappingSectorOpen(uint16_t min_distance_mm);
+static uint16_t TestApp_AutoMappingSectorScore(uint16_t a_mm, uint16_t b_mm);
+static void TestApp_AutoMappingChooseDirection(uint32_t now_ms);
 static void TestApp_ResetAutoMappingSectorMins(void);
 static bool TestApp_IsAutoFrontBlocked(uint32_t now_ms);
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms);
@@ -343,6 +364,7 @@ static void TestApp_RequestFullMapStream(void);
 static void TestApp_SendMapHeader(const char *state);
 static void TestApp_SendMapStat(void);
 static void TestApp_SendMpuState(void);
+static void TestApp_StartSlamReturnHome(void);
 static void TestApp_ResetMapNorth(void);
 static void TestApp_SendDirState(void);
 static int32_t AppAbs32(int32_t value);
@@ -693,11 +715,7 @@ static uint16_t GetObstacleSafeDistanceMm(void)
 
 static uint16_t GetAutoFrontBlockDistanceMm(void)
 {
-  uint16_t safe_mm = GetObstacleSafeDistanceMm();
-
-  return (safe_mm > AUTO_MAPPING_FRONT_BLOCK_MAX_MM) ?
-      AUTO_MAPPING_FRONT_BLOCK_MAX_MM :
-      safe_mm;
+  return GetObstacleSafeDistanceMm();
 }
 
 static bool PwmValueChanged(uint16_t current, uint16_t target)
@@ -1178,12 +1196,7 @@ static void TestApp_HandleBluetoothCommands(void)
         break;
 
       case BLUETOOTH_CMD_SLAM_NAV_RETURN:
-        TestApp_StopAutoMapping();
-        TestApp_StopAngleTurn(false);
-        MotorControl_Stop();
-        TestApp_ResumeMapping();
-        SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
-        SlamNav_StartReturnTo(MAPPING_START_X_MM, MAPPING_START_Y_MM);
+        TestApp_StartSlamReturnHome();
         break;
 
       case BLUETOOTH_CMD_GYRO_CALIBRATE:
@@ -1246,7 +1259,7 @@ static void TestApp_StartMapping(void)
   mapping_travel_residual_x1000 = 0L;
   MappingGrid_Reset();
   MappingGrid_SetPose(&mapping_pose);
-  MappingGrid_MarkRobotFree(&mapping_pose, 1U);
+  MappingGrid_MarkRobotFree(&mapping_pose, MAPPING_ROBOT_FREE_RADIUS_CELLS);
   TestApp_ResetPoseHistory();
 
   mapping_active = true;
@@ -1941,11 +1954,9 @@ static void TestApp_StopAngleTurn(bool completed)
   if (auto_mapping_active)
   {
     auto_mapping_resume_tick_ms = HAL_GetTick() + AUTO_MAPPING_TURN_SETTLE_MS;
-    auto_mapping_observe_after_resume = true;
-    if (completed)
-    {
-      auto_mapping_ignore_right_until_ms = auto_mapping_resume_tick_ms + AUTO_MAPPING_POST_TURN_DRIVE_MS;
-    }
+    auto_mapping_state = completed ? AUTO_MAPPING_STATE_TURN : AUTO_MAPPING_STATE_OBSERVE;
+    auto_mapping_observe_after_resume = !completed;
+    auto_mapping_ignore_right_until_ms = 0U;
   }
 
   (void)snprintf(
@@ -2040,6 +2051,7 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
 static void TestApp_StartAutoMapping(void)
 {
   auto_mapping_active = true;
+  auto_mapping_state = AUTO_MAPPING_STATE_IDLE;
   TestApp_ResetAutoMappingSectorMins();
   last_auto_mapping_control_tick_ms = 0U;
   auto_mapping_avoid_count = 0U;
@@ -2053,9 +2065,12 @@ static void TestApp_StartAutoMapping(void)
   auto_mapping_right_branch_confirm_count = 0U;
   auto_mapping_right_wall_seen = false;
   auto_mapping_observe_after_resume = false;
+  auto_mapping_step_start_left_counts = encoder_test.left_total;
+  auto_mapping_step_start_right_counts = encoder_test.right_total;
+  auto_mapping_step_travel_mm = 0L;
 
-  TestApp_StartAutoObservation("START");
-  (void)BluetoothControl_SendText("AUTO WALL START rule=right-hand\r\n");
+  (void)BluetoothControl_SendText("AUTO WALL START mode=step step=700mm sector=700mm\r\n");
+  TestApp_AutoMappingStartDriveStep("START");
 }
 
 static void TestApp_StopAutoMapping(void)
@@ -2066,6 +2081,7 @@ static void TestApp_StopAutoMapping(void)
   }
 
   auto_mapping_active = false;
+  auto_mapping_state = AUTO_MAPPING_STATE_IDLE;
   TestApp_ResetAutoMappingSectorMins();
   auto_mapping_resume_tick_ms = 0U;
   auto_mapping_ignore_right_until_ms = 0U;
@@ -2078,6 +2094,9 @@ static void TestApp_StopAutoMapping(void)
   auto_mapping_observe_scan_starts_remaining = 0U;
   auto_mapping_right_wall_seen = false;
   auto_mapping_observe_after_resume = false;
+  auto_mapping_step_start_left_counts = encoder_test.left_total;
+  auto_mapping_step_start_right_counts = encoder_test.right_total;
+  auto_mapping_step_travel_mm = 0L;
   MotorControl_Stop();
 }
 
@@ -2169,14 +2188,17 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
     auto_mapping_front_blocking_angle_cdeg = robot_angle_cdeg;
   }
 
-  if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
+  if ((auto_mapping_state == AUTO_MAPPING_STATE_DRIVE_STEP) &&
+      TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
       (clearance_mm <= GetAutoFrontBlockDistanceMm()))
   {
     auto_mapping_front_blocked_until_ms = HAL_GetTick() + AUTO_MAPPING_FRONT_BLOCK_HOLD_MS;
-    if (!angle_turn_active)
-    {
-      MotorControl_Stop();
-    }
+    MotorControl_Stop();
+  }
+
+  if (auto_mapping_state != AUTO_MAPPING_STATE_OBSERVE)
+  {
+    return;
   }
 
   if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) &&
@@ -2189,6 +2211,12 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
       (clearance_mm < auto_mapping_front_right_min_mm))
   {
     auto_mapping_front_right_min_mm = clearance_mm;
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) &&
+      (clearance_mm < auto_mapping_front_left_min_mm))
+  {
+    auto_mapping_front_left_min_mm = clearance_mm;
   }
 
   if ((TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
@@ -2226,6 +2254,7 @@ static void TestApp_StartAutoObservation(const char *reason)
   char line[96];
 
   TestApp_ResetAutoMappingSectorMins();
+  auto_mapping_state = AUTO_MAPPING_STATE_OBSERVE;
   auto_mapping_observe_scan_starts_remaining = AUTO_MAPPING_OBSERVE_SCAN_STARTS;
   auto_mapping_observe_deadline_ms = HAL_GetTick() + AUTO_MAPPING_OBSERVE_TIMEOUT_MS;
   MotorControl_Stop();
@@ -2244,56 +2273,195 @@ static void TestApp_StartAutoObservation(const char *reason)
   (void)BluetoothControl_SendText(line);
 }
 
+static void TestApp_AutoMappingStartDriveStep(const char *reason)
+{
+  MotorControlState_t motor_state = {0};
+  char line[120];
+  uint16_t drive_pwm;
+
+  if (reason == NULL)
+  {
+    reason = "DRIVE";
+  }
+
+  TestApp_ResetAutoMappingSectorMins();
+  auto_mapping_state = AUTO_MAPPING_STATE_DRIVE_STEP;
+  auto_mapping_observe_scan_starts_remaining = 0U;
+  auto_mapping_observe_deadline_ms = 0U;
+  auto_mapping_front_blocked_until_ms = 0U;
+  auto_mapping_step_start_left_counts = encoder_test.left_total;
+  auto_mapping_step_start_right_counts = encoder_test.right_total;
+  auto_mapping_step_travel_mm = 0L;
+
+  drive_pwm = ClampPwmPermille(GetDrivePwmPermille(), AUTO_MAPPING_MAX_DRIVE_PWM);
+  if (!MotorControl_GetState(&motor_state) ||
+      (motor_state.mode != 1U) ||
+      PwmValueChanged(motor_state.duty_permille, drive_pwm))
+  {
+    MotorControl_SetForward(drive_pwm);
+  }
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "AUTO WALL DRIVE reason=%s step=%ld safe=%u pwm=%u\r\n",
+      reason,
+      (long)AUTO_MAPPING_STEP_DISTANCE_MM,
+      (unsigned int)GetAutoFrontBlockDistanceMm(),
+      (unsigned int)drive_pwm);
+  (void)BluetoothControl_SendText(line);
+}
+
+static int32_t TestApp_AutoMappingGetStepTravelMm(void)
+{
+  int32_t left_counts =
+      AppAbs32(encoder_test.left_total - auto_mapping_step_start_left_counts);
+  int32_t right_counts =
+      AppAbs32(encoder_test.right_total - auto_mapping_step_start_right_counts);
+  int32_t average_counts = (left_counts + right_counts) / 2L;
+
+  return (average_counts * mapping_encoder_mm_per_count_x1000) / 1000L;
+}
+
+static bool TestApp_AutoMappingSectorOpen(uint16_t min_distance_mm)
+{
+  return ((min_distance_mm == UINT16_MAX) ||
+          (min_distance_mm > AUTO_MAPPING_SECTOR_CLEAR_MM));
+}
+
+static uint16_t TestApp_AutoMappingSectorScore(uint16_t a_mm, uint16_t b_mm)
+{
+  if ((a_mm == UINT16_MAX) && (b_mm == UINT16_MAX))
+  {
+    return UINT16_MAX;
+  }
+
+  if (a_mm == UINT16_MAX)
+  {
+    return b_mm;
+  }
+
+  if (b_mm == UINT16_MAX)
+  {
+    return a_mm;
+  }
+
+  return (a_mm < b_mm) ? a_mm : b_mm;
+}
+
+static void TestApp_AutoMappingChooseDirection(uint32_t now_ms)
+{
+  char line[192];
+  bool drive_hold_active = TestApp_IsAutoFrontBlocked(now_ms);
+  bool front_open = TestApp_AutoMappingSectorOpen(auto_mapping_front_min_mm);
+  bool right_open =
+      TestApp_AutoMappingSectorOpen(auto_mapping_right_min_mm) &&
+      TestApp_AutoMappingSectorOpen(auto_mapping_front_right_min_mm);
+  bool left_open =
+      TestApp_AutoMappingSectorOpen(auto_mapping_left_min_mm) &&
+      TestApp_AutoMappingSectorOpen(auto_mapping_front_left_min_mm);
+  uint16_t right_score = TestApp_AutoMappingSectorScore(
+      auto_mapping_right_min_mm,
+      auto_mapping_front_right_min_mm);
+  uint16_t left_score = TestApp_AutoMappingSectorScore(
+      auto_mapping_left_min_mm,
+      auto_mapping_front_left_min_mm);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "AUTO WALL DECIDE front=%u right=%u fr=%u left=%u fl=%u open=%u,%u,%u travel=%ld safe=%u hold=%u\r\n",
+      (unsigned int)auto_mapping_front_min_mm,
+      (unsigned int)auto_mapping_right_min_mm,
+      (unsigned int)auto_mapping_front_right_min_mm,
+      (unsigned int)auto_mapping_left_min_mm,
+      (unsigned int)auto_mapping_front_left_min_mm,
+      (unsigned int)front_open,
+      (unsigned int)right_open,
+      (unsigned int)left_open,
+      (long)auto_mapping_step_travel_mm,
+      (unsigned int)GetAutoFrontBlockDistanceMm(),
+      (unsigned int)drive_hold_active);
+  (void)BluetoothControl_SendText(line);
+
+  if (front_open)
+  {
+    TestApp_AutoMappingStartDriveStep("FRONT_OPEN");
+    return;
+  }
+
+  if (right_open && (!left_open || (right_score >= left_score)))
+  {
+    TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_GRID_TURN_DEG, "RIGHT_OPEN", now_ms);
+    return;
+  }
+
+  if (left_open)
+  {
+    TestApp_AutoMappingStartTurn(-1, AUTO_MAPPING_GRID_TURN_DEG, "LEFT_OPEN", now_ms);
+    return;
+  }
+
+  TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_U_TURN_DEG, "DEAD_END", now_ms);
+}
+
 static void TestApp_UpdateAutoMapping(uint32_t now_ms)
 {
   MotorControlState_t motor_state = {0};
-  uint16_t safe_mm;
-  uint16_t side_open_mm;
-  uint16_t right_open_mm;
-  uint16_t front_right_open_mm;
-  uint16_t right_wall_seen_mm;
   uint16_t drive_pwm;
-  bool front_open;
-  bool front_blocked;
-  bool right_seen;
-  bool front_right_seen;
-  bool left_seen;
-  bool right_open;
-  bool front_right_open;
-  bool left_open;
-  bool right_turn_candidate;
 
   if (!auto_mapping_active)
   {
+    auto_mapping_state = AUTO_MAPPING_STATE_IDLE;
     TestApp_ResetAutoMappingSectorMins();
     return;
   }
 
   if (angle_turn_active)
   {
+    auto_mapping_state = AUTO_MAPPING_STATE_TURN;
     TestApp_ResetAutoMappingSectorMins();
     return;
   }
 
-  if ((int32_t)(now_ms - auto_mapping_resume_tick_ms) < 0L)
+  if ((auto_mapping_resume_tick_ms != 0U) &&
+      ((int32_t)(now_ms - auto_mapping_resume_tick_ms) < 0L))
   {
     return;
   }
 
-  if (auto_mapping_observe_after_resume)
+  if (auto_mapping_resume_tick_ms != 0U)
   {
-    auto_mapping_observe_after_resume = false;
-    TestApp_StartAutoObservation("AFTER_TURN");
-    return;
-  }
-
-  if (auto_mapping_observe_scan_starts_remaining > 0U)
-  {
-    if ((int32_t)(now_ms - auto_mapping_observe_deadline_ms) < 0L)
+    auto_mapping_resume_tick_ms = 0U;
+    if (auto_mapping_observe_after_resume)
     {
+      auto_mapping_observe_after_resume = false;
+      TestApp_StartAutoObservation("TURN_STOP");
       return;
     }
-    auto_mapping_observe_scan_starts_remaining = 0U;
+    if (auto_mapping_state == AUTO_MAPPING_STATE_TURN)
+    {
+      TestApp_AutoMappingStartDriveStep("TURN_DONE");
+      return;
+    }
+  }
+
+  if (auto_mapping_state == AUTO_MAPPING_STATE_IDLE)
+  {
+    TestApp_AutoMappingStartDriveStep("IDLE");
+    return;
+  }
+
+  if (auto_mapping_state == AUTO_MAPPING_STATE_OBSERVE)
+  {
+    if (auto_mapping_observe_scan_starts_remaining > 0U)
+    {
+      if ((int32_t)(now_ms - auto_mapping_observe_deadline_ms) < 0L)
+      {
+        return;
+      }
+      auto_mapping_observe_scan_starts_remaining = 0U;
+    }
   }
 
   if ((now_ms - last_auto_mapping_control_tick_ms) < AUTO_MAPPING_CONTROL_INTERVAL_MS)
@@ -2302,60 +2470,23 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   }
   last_auto_mapping_control_tick_ms = now_ms;
 
-  safe_mm = GetAutoFrontBlockDistanceMm();
-  side_open_mm = (uint16_t)(safe_mm + AUTO_MAPPING_OPEN_MARGIN_MM);
-  right_open_mm = (uint16_t)(safe_mm + AUTO_MAPPING_RIGHT_OPEN_MARGIN_MM);
-  if (right_open_mm < AUTO_MAPPING_MIN_RIGHT_OPEN_MM)
+  if (auto_mapping_state == AUTO_MAPPING_STATE_DRIVE_STEP)
   {
-    right_open_mm = AUTO_MAPPING_MIN_RIGHT_OPEN_MM;
-  }
-  front_right_open_mm = right_open_mm;
-  if (front_right_open_mm < AUTO_MAPPING_MIN_FRONT_RIGHT_OPEN_MM)
-  {
-    front_right_open_mm = AUTO_MAPPING_MIN_FRONT_RIGHT_OPEN_MM;
-  }
-  right_wall_seen_mm = (uint16_t)(safe_mm + AUTO_MAPPING_RIGHT_WALL_MARGIN_MM);
-  front_blocked = TestApp_IsAutoFrontBlocked(now_ms);
-  front_open = !front_blocked &&
-      ((auto_mapping_front_min_mm == UINT16_MAX) || (auto_mapping_front_min_mm > safe_mm));
-  right_seen = (auto_mapping_right_min_mm != UINT16_MAX);
-  front_right_seen = (auto_mapping_front_right_min_mm != UINT16_MAX);
-  left_seen = (auto_mapping_left_min_mm != UINT16_MAX);
-  right_open = right_seen && (auto_mapping_right_min_mm > right_open_mm);
-  front_right_open = front_right_seen && (auto_mapping_front_right_min_mm > front_right_open_mm);
-  left_open = left_seen && (auto_mapping_left_min_mm > side_open_mm);
-
-  if (right_seen && (auto_mapping_right_min_mm <= right_wall_seen_mm))
-  {
-    auto_mapping_right_wall_seen = true;
-    auto_mapping_right_branch_confirm_count = 0U;
-  }
-
-  right_turn_candidate = right_open &&
-      front_right_open &&
-      (front_blocked || (front_open && auto_mapping_right_wall_seen)) &&
-      ((int32_t)(now_ms - auto_mapping_ignore_right_until_ms) >= 0L);
-
-  if (right_turn_candidate)
-  {
-    if (auto_mapping_right_branch_confirm_count < AUTO_MAPPING_RIGHT_BRANCH_CONFIRM_COUNT)
+    auto_mapping_step_travel_mm = TestApp_AutoMappingGetStepTravelMm();
+    if (TestApp_IsAutoFrontBlocked(now_ms))
     {
-      auto_mapping_right_branch_confirm_count++;
+      MotorControl_Stop();
+      TestApp_StartAutoObservation("FRONT_BLOCKED");
+      return;
     }
-  }
-  else if (!right_open || !front_right_open)
-  {
-    auto_mapping_right_branch_confirm_count = 0U;
-  }
 
-  if (right_turn_candidate &&
-      (auto_mapping_right_branch_confirm_count >= AUTO_MAPPING_RIGHT_BRANCH_CONFIRM_COUNT))
-  {
-    MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_GRID_TURN_DEG, "RIGHT_OPEN", now_ms);
-  }
-  else if (front_open)
-  {
+    if (auto_mapping_step_travel_mm >= AUTO_MAPPING_STEP_DISTANCE_MM)
+    {
+      MotorControl_Stop();
+      TestApp_StartAutoObservation("STEP_DONE");
+      return;
+    }
+
     drive_pwm = ClampPwmPermille(GetDrivePwmPermille(), AUTO_MAPPING_MAX_DRIVE_PWM);
     if (!MotorControl_GetState(&motor_state) ||
         (motor_state.mode != 1U) ||
@@ -2363,19 +2494,14 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
     {
       MotorControl_SetForward(drive_pwm);
     }
-  }
-  else if (left_open)
-  {
-    MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(-1, AUTO_MAPPING_GRID_TURN_DEG, "LEFT_OPEN", now_ms);
-  }
-  else
-  {
-    MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_U_TURN_DEG, "DEAD_END", now_ms);
+    return;
   }
 
-  TestApp_ResetAutoMappingSectorMins();
+  if (auto_mapping_state == AUTO_MAPPING_STATE_OBSERVE)
+  {
+    MotorControl_Stop();
+    TestApp_AutoMappingChooseDirection(now_ms);
+  }
 }
 
 static void TestApp_ResetAutoMappingSectorMins(void)
@@ -2385,6 +2511,7 @@ static void TestApp_ResetAutoMappingSectorMins(void)
   auto_mapping_right_min_mm = UINT16_MAX;
   auto_mapping_front_right_min_mm = UINT16_MAX;
   auto_mapping_left_min_mm = UINT16_MAX;
+  auto_mapping_front_left_min_mm = UINT16_MAX;
   auto_mapping_right_best_distance_mm = 0U;
   auto_mapping_right_best_angle_cdeg = AUTO_MAPPING_RIGHT_CENTER_CDEG;
   auto_mapping_left_best_distance_mm = 0U;
@@ -2442,14 +2569,15 @@ static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t reque
 
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms)
 {
-  char line[224];
+  char line[256];
   int32_t target_heading_cdeg;
   int32_t snapped_error_cdeg;
   uint16_t snapped_degrees;
 
+  auto_mapping_state = AUTO_MAPPING_STATE_TURN;
   auto_mapping_avoid_count++;
   auto_mapping_resume_tick_ms = now_ms + AUTO_MAPPING_TURN_SETTLE_MS;
-  auto_mapping_ignore_right_until_ms = auto_mapping_resume_tick_ms + AUTO_MAPPING_POST_TURN_DRIVE_MS;
+  auto_mapping_ignore_right_until_ms = 0U;
   auto_mapping_right_branch_confirm_count = 0U;
   auto_mapping_right_wall_seen = false;
   if (degrees >= 135U)
@@ -2476,7 +2604,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u wall=%u conf=%u count=%lu\r\n",
+      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u fl=%u wall=%u conf=%u count=%lu\r\n",
       reason,
       (direction < 0) ? 'L' : 'R',
       (unsigned int)degrees,
@@ -2489,6 +2617,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
       (unsigned int)auto_mapping_right_min_mm,
       (unsigned int)auto_mapping_front_right_min_mm,
       (unsigned int)auto_mapping_left_min_mm,
+      (unsigned int)auto_mapping_front_left_min_mm,
       (unsigned int)auto_mapping_right_wall_seen,
       (unsigned int)auto_mapping_right_branch_confirm_count,
       (unsigned long)auto_mapping_avoid_count);
@@ -2660,6 +2789,34 @@ static void TestApp_SendMpuState(void)
       (long)mapping_pose.heading_cdeg,
       (unsigned int)mapping_active,
       (unsigned int)gyro_calibration_active);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_StartSlamReturnHome(void)
+{
+  char line[128];
+
+  SlamNav_Stop();
+  TestApp_StopAutoMapping();
+  TestApp_StopAngleTurn(false);
+  MotorControl_Stop();
+  TestApp_ResumeMapping();
+
+  MappingGrid_SetPose(&mapping_pose);
+  MappingGrid_MarkRobotFree(&mapping_pose, MAPPING_ROBOT_FREE_RADIUS_CELLS);
+
+  SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
+  SlamNav_StartReturnTo(MAPPING_START_X_MM, MAPPING_START_Y_MM);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "BACK START from=%ld,%ld,%ld goal=%ld,%ld\r\n",
+      (long)mapping_pose.x_mm,
+      (long)mapping_pose.y_mm,
+      (long)NormalizeHeadingCdeg(mapping_pose.heading_cdeg),
+      (long)MAPPING_START_X_MM,
+      (long)MAPPING_START_Y_MM);
   (void)BluetoothControl_SendText(line);
 }
 

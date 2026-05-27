@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     list_ports = None
 
 
-DEFAULT_PORT = "COM3"
+DEFAULT_PORT = "COM6"
 DEFAULT_BAUD = 921600
 LOG_LIMIT = 500
 BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth", "spp")

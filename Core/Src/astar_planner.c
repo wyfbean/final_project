@@ -5,6 +5,7 @@
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
 #define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
 #define ASTAR_FRONTIER_HEADING_TIE_CELLS 2U
+#define ASTAR_FRONTIER_LOOKAHEAD_MIN_CELLS 4U
 #define ASTAR_FRONTIER_NO_BIAS 0xFFU
 #define ASTAR_OBSTACLE_INFLATION_CELLS 0
 #define ASTAR_FREE_STEP_COST 1U
@@ -22,6 +23,7 @@ typedef struct
 static uint16_t s_g_score[ASTAR_TOTAL_CELLS];
 static uint16_t s_parent[ASTAR_TOTAL_CELLS];
 static uint8_t s_node_flags[ASTAR_TOTAL_CELLS];
+static uint8_t s_first_step_preference[ASTAR_TOTAL_CELLS];
 static AstarFrontierCandidate_t s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_LIMIT];
 
 static uint16_t Astar_Index(uint8_t x, uint8_t y);
@@ -64,12 +66,20 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
                                                uint8_t start_y,
                                                uint8_t goal_x,
                                                uint8_t goal_y,
+                                               const int32_t *preferred_headings_cdeg,
+                                               uint8_t preferred_heading_count,
                                                AstarPlannerPath_t *out_path);
 static bool Astar_ReconstructPath(uint16_t start_index,
                                   uint16_t goal_index,
                                   AstarPlannerPath_t *out_path);
 static void Astar_ClearSearch(void);
 static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y);
+static uint8_t Astar_DirectionPreference(uint8_t from_x,
+                                         uint8_t from_y,
+                                         uint8_t to_x,
+                                         uint8_t to_y,
+                                         const int32_t *preferred_headings_cdeg,
+                                         uint8_t preferred_heading_count);
 static int32_t Astar_NormalizeHeadingCdeg(int32_t heading_cdeg);
 static int32_t Astar_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t Astar_Abs32(int32_t value);
@@ -143,7 +153,7 @@ static AstarPlannerStatus_t Astar_PlanToFrontierInternal(const MappingGridSnapsh
     AstarPlannerStatus_t status;
 
     Astar_Cell(s_frontier_candidates[i].index, &goal_x, &goal_y);
-    status = Astar_SearchToGoal(snapshot, start_x, start_y, goal_x, goal_y, out_path);
+    status = Astar_SearchToGoal(snapshot, start_x, start_y, goal_x, goal_y, NULL, 0U, out_path);
     if ((status == ASTAR_PLANNER_STATUS_OK) ||
         (status == ASTAR_PLANNER_STATUS_PATH_TRUNCATED))
     {
@@ -164,6 +174,26 @@ AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapsh
                                              uint8_t goal_x,
                                              uint8_t goal_y,
                                              AstarPlannerPath_t *out_path)
+{
+  return AstarPlanner_PlanToGoalBiased(
+      snapshot,
+      start_x,
+      start_y,
+      goal_x,
+      goal_y,
+      NULL,
+      0U,
+      out_path);
+}
+
+AstarPlannerStatus_t AstarPlanner_PlanToGoalBiased(const MappingGridSnapshot_t *snapshot,
+                                                   uint8_t start_x,
+                                                   uint8_t start_y,
+                                                   uint8_t goal_x,
+                                                   uint8_t goal_y,
+                                                   const int32_t *preferred_headings_cdeg,
+                                                   uint8_t preferred_heading_count,
+                                                   AstarPlannerPath_t *out_path)
 {
   AstarPlannerStatus_t status;
 
@@ -191,7 +221,15 @@ AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapsh
     return out_path->status;
   }
 
-  status = Astar_SearchToGoal(snapshot, start_x, start_y, goal_x, goal_y, out_path);
+  status = Astar_SearchToGoal(
+      snapshot,
+      start_x,
+      start_y,
+      goal_x,
+      goal_y,
+      preferred_headings_cdeg,
+      preferred_heading_count,
+      out_path);
   out_path->target.x = goal_x;
   out_path->target.y = goal_y;
   out_path->status = status;
@@ -425,6 +463,9 @@ static bool Astar_CandidateBetter(uint8_t preference,
                                   uint8_t other_preference,
                                   uint16_t other_distance)
 {
+  bool distance_has_lookahead = distance >= ASTAR_FRONTIER_LOOKAHEAD_MIN_CELLS;
+  bool other_has_lookahead = other_distance >= ASTAR_FRONTIER_LOOKAHEAD_MIN_CELLS;
+
   if ((preference != ASTAR_FRONTIER_NO_BIAS) ||
       (other_preference != ASTAR_FRONTIER_NO_BIAS))
   {
@@ -432,6 +473,11 @@ static bool Astar_CandidateBetter(uint8_t preference,
     {
       return preference < other_preference;
     }
+  }
+
+  if (distance_has_lookahead != other_has_lookahead)
+  {
+    return distance_has_lookahead;
   }
 
   if ((distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < other_distance)
@@ -500,6 +546,8 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
                                                uint8_t start_y,
                                                uint8_t goal_x,
                                                uint8_t goal_y,
+                                               const int32_t *preferred_headings_cdeg,
+                                               uint8_t preferred_heading_count,
                                                AstarPlannerPath_t *out_path)
 {
   static const int8_t offsets[4][2] = {
@@ -549,6 +597,7 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
       int16_t ny = (int16_t)current_y + offsets[i][1];
       uint16_t neighbor;
       uint16_t tentative_g;
+      uint8_t first_step_preference;
 
       if (!Astar_IsInside(nx, ny))
       {
@@ -567,11 +616,29 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
       }
 
       tentative_g = (uint16_t)(s_g_score[current] + ASTAR_FREE_STEP_COST);
+      if (current == start_index)
+      {
+        first_step_preference = Astar_DirectionPreference(
+            start_x,
+            start_y,
+            (uint8_t)nx,
+            (uint8_t)ny,
+            preferred_headings_cdeg,
+            preferred_heading_count);
+      }
+      else
+      {
+        first_step_preference = s_first_step_preference[current];
+      }
+
       if (((s_node_flags[neighbor] & ASTAR_NODE_FLAG_OPEN) == 0U) ||
-          (tentative_g < s_g_score[neighbor]))
+          (tentative_g < s_g_score[neighbor]) ||
+          ((tentative_g == s_g_score[neighbor]) &&
+           (first_step_preference < s_first_step_preference[neighbor])))
       {
         s_parent[neighbor] = current;
         s_g_score[neighbor] = tentative_g;
+        s_first_step_preference[neighbor] = first_step_preference;
         s_node_flags[neighbor] |= ASTAR_NODE_FLAG_OPEN;
       }
     }
@@ -631,6 +698,7 @@ static void Astar_ClearSearch(void)
     s_g_score[i] = ASTAR_COST_INF;
     s_parent[i] = ASTAR_COST_INF;
     s_node_flags[i] = 0U;
+    s_first_step_preference[i] = ASTAR_FRONTIER_NO_BIAS;
   }
 }
 
@@ -639,6 +707,7 @@ static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y)
   uint16_t best_index = ASTAR_COST_INF;
   uint16_t best_f = ASTAR_COST_INF;
   uint16_t best_h = ASTAR_COST_INF;
+  uint8_t best_preference = ASTAR_FRONTIER_NO_BIAS;
   uint16_t i;
 
   for (i = 0U; i < ASTAR_TOTAL_CELLS; ++i)
@@ -655,12 +724,45 @@ static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y)
       f = (uint16_t)(s_g_score[i] + h);
       if ((best_index == ASTAR_COST_INF) ||
           (f < best_f) ||
-          ((f == best_f) && (h < best_h)))
+          ((f == best_f) && (h < best_h)) ||
+          ((f == best_f) && (h == best_h) && (s_first_step_preference[i] < best_preference)))
       {
         best_index = i;
         best_f = f;
         best_h = h;
+        best_preference = s_first_step_preference[i];
       }
+    }
+  }
+
+  return best_index;
+}
+
+static uint8_t Astar_DirectionPreference(uint8_t from_x,
+                                         uint8_t from_y,
+                                         uint8_t to_x,
+                                         uint8_t to_y,
+                                         const int32_t *preferred_headings_cdeg,
+                                         uint8_t preferred_heading_count)
+{
+  int32_t heading_cdeg;
+  uint8_t i;
+  uint8_t best_index = ASTAR_FRONTIER_NO_BIAS;
+  int32_t best_error = 36000L;
+
+  if ((preferred_headings_cdeg == NULL) || (preferred_heading_count == 0U))
+  {
+    return ASTAR_FRONTIER_NO_BIAS;
+  }
+
+  heading_cdeg = Astar_CandidateHeadingCdeg(from_x, from_y, to_x, to_y);
+  for (i = 0U; i < preferred_heading_count; ++i)
+  {
+    int32_t error = Astar_Abs32(Astar_SignedHeadingErrorCdeg(preferred_headings_cdeg[i], heading_cdeg));
+    if (error < best_error)
+    {
+      best_error = error;
+      best_index = i;
     }
   }
 
