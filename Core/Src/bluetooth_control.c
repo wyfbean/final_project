@@ -367,7 +367,9 @@ static bool BluetoothControl_IsPriorityTxLine(const char *text)
          (strncmp(text, "MPU STATE", 9U) == 0) ||
          (strncmp(text, "DIR ", 4U) == 0) ||
          (strncmp(text, "LIDAR QUALITY", 13U) == 0) ||
-         (strncmp(text, "LIDAR FRONT", 11U) == 0);
+         (strncmp(text, "LIDAR FRONT", 11U) == 0) ||
+         (strncmp(text, "LIDAR SECTOR", 12U) == 0) ||
+         (strncmp(text, "LIDAR BLOCK", 11U) == 0);
 }
 
 static bool BluetoothControl_IsUrgentCommand(BluetoothCommandType_t command)
@@ -439,6 +441,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_GYRO_CALIBRATE:  return "GYRO_CALIBRATE";
     case BLUETOOTH_CMD_MPU_STATE:       return "MPU_STATE";
     case BLUETOOTH_CMD_LIDAR_FRONT_STATE:return "LIDAR_FRONT_STATE";
+    case BLUETOOTH_CMD_LIDAR_SECTOR_STATE:return "LIDAR_SECTOR_STATE";
     case BLUETOOTH_CMD_DIR_RESET:       return "DIR_RESET";
     case BLUETOOTH_CMD_DIR_STATE:       return "DIR_STATE";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
@@ -885,6 +888,19 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "LIDAR FRONT AREA STATUS") == 0))
   {
     return BLUETOOTH_CMD_LIDAR_FRONT_STATE;
+  }
+
+  if ((strcmp(line, "SECTOR") == 0) ||
+      (strcmp(line, "SECTORS") == 0) ||
+      (strcmp(line, "BLOCKS") == 0) ||
+      (strcmp(line, "LIDAR SECTOR") == 0) ||
+      (strcmp(line, "LIDAR SECTORS") == 0) ||
+      (strcmp(line, "LIDAR BLOCK") == 0) ||
+      (strcmp(line, "LIDAR BLOCKS") == 0) ||
+      (strcmp(line, "LIDAR SECTOR STATE") == 0) ||
+      (strcmp(line, "LIDAR SECTOR STATUS") == 0))
+  {
+    return BLUETOOTH_CMD_LIDAR_SECTOR_STATE;
   }
 
   if ((strcmp(line, "DIR") == 0) ||

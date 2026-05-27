@@ -23,12 +23,12 @@
 #define SLAM_NAV_MAX_DRIVE_PWM          420U
 #define SLAM_NAV_MAX_TURN_PWM           390U
 #define SLAM_NAV_MIN_SAFE_MM            0U
-#define SLAM_NAV_NAV_MIN_POINT_QUALITY  25U
-#define SLAM_NAV_MAX_LOCAL_BLOCK_MM     650U
-#define SLAM_NAV_LOCAL_CLEARANCE_MM     150U
+#define SLAM_NAV_NAV_MIN_POINT_QUALITY  5U
+#define SLAM_NAV_MAX_LOCAL_BLOCK_MM     900U
+#define SLAM_NAV_LOCAL_CLEARANCE_MM     250U
 #define SLAM_NAV_MIN_DRIVE_PWM          300U
 #define SLAM_NAV_MIN_TURN_PWM           300U
-#define SLAM_NAV_FRONT_SECTOR_CDEG      1500U
+#define SLAM_NAV_FRONT_SECTOR_CDEG      2200U
 #define SLAM_NAV_SIDE_SECTOR_CDEG       3000U
 #define SLAM_NAV_DIAGONAL_SECTOR_CDEG   1800U
 #define SLAM_NAV_RIGHT_CENTER_CDEG      9000U
@@ -36,11 +36,9 @@
 #define SLAM_NAV_LEFT_CENTER_CDEG       27000U
 #define SLAM_NAV_FRONT_RIGHT_CENTER_CDEG 4500U
 #define SLAM_NAV_FRONT_LEFT_CENTER_CDEG 31500U
-#define SLAM_NAV_FRONT_BODY_OFFSET_MM  200U
-#define SLAM_NAV_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
-#define SLAM_NAV_FRONT_BLOCK_MIN_POINTS 3U
-#define SLAM_NAV_FRONT_BLOCK_HOLD_MS    600U
-#define SLAM_NAV_FRONT_BLOCK_CONFIRM_MS 450U
+#define SLAM_NAV_FRONT_BLOCK_MIN_POINTS 2U
+#define SLAM_NAV_FRONT_BLOCK_HOLD_MS    800U
+#define SLAM_NAV_FRONT_BLOCK_CONFIRM_MS 150U
 #define SLAM_NAV_TURN_TOL_CDEG          1200L
 #define SLAM_NAV_TURN_SETTLE_MS         280U
 #define SLAM_NAV_DRIVE_HEADING_TOL_CDEG 2600L
@@ -51,7 +49,7 @@
 #define SLAM_NAV_PATH_TX_INTERVAL_MS    1000U
 #define SLAM_NAV_PATH_CHUNK_CELLS       10U
 #define SLAM_NAV_TURN_TIMEOUT_MS        6000U
-#define SLAM_NAV_BLOCKED_REPLAN_WAIT_MS 600U
+#define SLAM_NAV_BLOCKED_REPLAN_WAIT_MS 0U
 #define SLAM_NAV_TEMP_BLOCKED_CELLS     12U
 #define SLAM_NAV_TEMP_BLOCK_TTL_MS      2000U
 #define SLAM_NAV_TEMP_BLOCK_LOOKAHEAD_CELLS 1U
@@ -169,7 +167,6 @@ static void SlamNav_UpdateSectorMin(uint16_t *value, uint16_t distance_mm);
 static void SlamNav_UpdateSectorStats(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 static SlamNavSectorStats_t SlamNav_GetSectorSnapshot(uint32_t now);
 static bool SlamNav_IsSectorOpen(uint16_t distance_mm, uint16_t local_block_mm);
-static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 static bool SlamNav_CellStepFromHeading(int32_t heading_cdeg, int8_t *out_dx, int8_t *out_dy);
 static void SlamNav_ClearTemporaryBlockedCells(void);
 static void SlamNav_RecordTemporaryBlockedCell(uint8_t x, uint8_t y, uint32_t now);
@@ -328,7 +325,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   }
 
   robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
-  clearance_mm = SlamNav_ApplyForwardBodyOffset(robot_angle_cdeg, point->distance_mm);
+  clearance_mm = point->distance_mm;
   if ((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U)
   {
     taskENTER_CRITICAL();
@@ -347,7 +344,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   }
 
   taskENTER_CRITICAL();
-  safe_mm = s_safe_distance_mm;
+  safe_mm = SlamNav_LocalBlockDistanceMm(s_safe_distance_mm);
   taskEXIT_CRITICAL();
 
   if (clearance_mm > safe_mm)
@@ -798,6 +795,8 @@ static void SlamNav_UpdateDrive(void)
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_REPLAN;
     s_state_enter_tick_ms = HAL_GetTick();
+    s_replan_after_tick_ms = 0U;
+    s_last_path_tx_valid = false;
     SlamNav_SendStatus("REPLAN", "TARGET_BLOCKED");
     return;
   }
@@ -843,6 +842,7 @@ static void SlamNav_UpdateDrive(void)
     s_state = SLAM_NAV_STATE_REPLAN;
     s_state_enter_tick_ms = now;
     s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+    s_last_path_tx_valid = false;
     SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
     return;
   }
@@ -1107,33 +1107,6 @@ static SlamNavSectorStats_t SlamNav_GetSectorSnapshot(uint32_t now)
 static bool SlamNav_IsSectorOpen(uint16_t distance_mm, uint16_t local_block_mm)
 {
   return (distance_mm == UINT16_MAX) || (distance_mm > local_block_mm);
-}
-
-static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm)
-{
-  uint16_t offset_mm = 0U;
-
-  if (distance_mm == 0U)
-  {
-    return 0U;
-  }
-
-  if (SlamNav_IsFrontAngle(robot_angle_cdeg))
-  {
-    offset_mm = SLAM_NAV_FRONT_BODY_OFFSET_MM;
-  }
-  else if (SlamNav_IsAngleNear(robot_angle_cdeg, SLAM_NAV_FRONT_RIGHT_CENTER_CDEG, SLAM_NAV_DIAGONAL_SECTOR_CDEG) ||
-           SlamNav_IsAngleNear(robot_angle_cdeg, SLAM_NAV_FRONT_LEFT_CENTER_CDEG, SLAM_NAV_DIAGONAL_SECTOR_CDEG))
-  {
-    offset_mm = SLAM_NAV_FRONT_DIAGONAL_BODY_OFFSET_MM;
-  }
-
-  if (offset_mm == 0U)
-  {
-    return distance_mm;
-  }
-
-  return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 1U;
 }
 
 static bool SlamNav_CellStepFromHeading(int32_t heading_cdeg, int8_t *out_dx, int8_t *out_dy)

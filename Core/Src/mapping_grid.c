@@ -13,13 +13,15 @@
 #define MAPPING_GRID_FREE_DELTA        3
 #define MAPPING_GRID_FREE_POSITIVE_DELTA 2
 #define MAPPING_GRID_FREE_OCCUPIED_DELTA 3
-#define MAPPING_GRID_OCCUPIED_DELTA    8
+#define MAPPING_GRID_OCCUPIED_DELTA    6
+#define MAPPING_GRID_NEAR_OCCUPIED_DELTA 3
 #define MAPPING_GRID_MIN_SCORE         (-40)
 #define MAPPING_GRID_MAX_SCORE         30
 #define MAPPING_GRID_FREE_THRESHOLD    (-6)
-#define MAPPING_GRID_OCCUPIED_THRESHOLD 14
-#define MAPPING_GRID_MIN_DISTANCE_MM   80U
-#define MAPPING_GRID_MIN_QUALITY       0U
+#define MAPPING_GRID_OCCUPIED_THRESHOLD 18
+#define MAPPING_GRID_MIN_DISTANCE_MM   175U
+#define MAPPING_GRID_NEAR_WEAK_DISTANCE_MM (MAPPING_GRID_CELL_SIZE_MM * 3U)
+#define MAPPING_GRID_MIN_QUALITY       5U
 #define MAPPING_GRID_PI                3.14159265358979323846f
 
 static int8_t s_grid[MAPPING_GRID_HEIGHT_CELLS][MAPPING_GRID_WIDTH_CELLS];
@@ -34,7 +36,7 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
                                                  uint16_t distance_mm,
                                                  uint8_t quality);
 static void MappingGrid_MarkFree(uint8_t x, uint8_t y);
-static void MappingGrid_MarkOccupied(uint8_t x, uint8_t y);
+static void MappingGrid_MarkOccupied(uint8_t x, uint8_t y, uint16_t distance_mm);
 static void MappingGrid_UpdateScore(uint8_t x, uint8_t y, int8_t delta);
 static void MappingGrid_ForceFree(uint8_t x, uint8_t y);
 static void MappingGrid_ApplyStateChange(MappingGridCellState_t old_state, MappingGridCellState_t new_state);
@@ -132,7 +134,8 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
   int32_t hit_world_y_mm;
   float angle_rad;
 
-  if ((distance_mm < MAPPING_GRID_MIN_DISTANCE_MM) ||
+  if ((quality < MAPPING_GRID_MIN_QUALITY) ||
+      (distance_mm < MAPPING_GRID_MIN_DISTANCE_MM) ||
       (distance_mm > MAPPING_GRID_MAX_RANGE_MM))
   {
     s_stats.rejected_points++;
@@ -155,8 +158,10 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
   if (MappingGrid_WorldToCell(hit_world_x_mm, hit_world_y_mm, &hit_x, &hit_y))
   {
     MappingGrid_TraceFreeRay(robot_x, robot_y, hit_x, hit_y);
-    MappingGrid_MarkOccupied(hit_x, hit_y);
-    s_stats.occupied_updates++;
+    if ((hit_x != robot_x) || (hit_y != robot_y))
+    {
+      MappingGrid_MarkOccupied(hit_x, hit_y, distance_mm);
+    }
   }
   else if (MappingGrid_FindClippedRayEnd(pose->x_mm, pose->y_mm, hit_world_x_mm, hit_world_y_mm, &hit_x, &hit_y))
   {
@@ -385,9 +390,13 @@ static void MappingGrid_MarkFree(uint8_t x, uint8_t y)
   s_stats.free_ray_updates++;
 }
 
-static void MappingGrid_MarkOccupied(uint8_t x, uint8_t y)
+static void MappingGrid_MarkOccupied(uint8_t x, uint8_t y, uint16_t distance_mm)
 {
-  MappingGrid_UpdateScore(x, y, MAPPING_GRID_OCCUPIED_DELTA);
+  int8_t delta = (distance_mm <= MAPPING_GRID_NEAR_WEAK_DISTANCE_MM) ?
+      MAPPING_GRID_NEAR_OCCUPIED_DELTA :
+      MAPPING_GRID_OCCUPIED_DELTA;
+
+  MappingGrid_UpdateScore(x, y, delta);
   s_stats.occupied_updates++;
 }
 
