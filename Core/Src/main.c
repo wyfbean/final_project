@@ -74,8 +74,9 @@
 #define AUTO_MAPPING_DIAGONAL_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_FRONT_BODY_OFFSET_MM 200U
 #define AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
-#define AUTO_MAPPING_MIN_SAFE_MM    350U
-#define AUTO_MAPPING_MAX_SAFE_MM    3000U
+#define AUTO_MAPPING_MIN_POINT_QUALITY 25U
+#define AUTO_MAPPING_MIN_SAFE_MM    0U
+#define AUTO_MAPPING_MAX_SAFE_MM    1000U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
 #define AUTO_MAPPING_STEP_DISTANCE_MM 700L
 #define AUTO_MAPPING_SECTOR_CLEAR_MM 700U
@@ -342,7 +343,9 @@ static bool TestApp_IsLidarAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, 
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point);
 static void TestApp_StartAutoObservation(const char *reason);
 static void TestApp_AutoMappingStartDriveStep(const char *reason);
+static void TestApp_AutoMappingGetStepCounts(int32_t *left_counts, int32_t *right_counts, int32_t *average_counts);
 static int32_t TestApp_AutoMappingGetStepTravelMm(void);
+static void TestApp_AutoMappingReportStepStop(const char *reason);
 static bool TestApp_AutoMappingSectorOpen(uint16_t min_distance_mm);
 static uint16_t TestApp_AutoMappingSectorScore(uint16_t a_mm, uint16_t b_mm);
 static void TestApp_AutoMappingChooseDirection(uint32_t now_ms);
@@ -1615,11 +1618,12 @@ static void TestApp_StopOdomDebug(void)
 
 static void TestApp_EndEncoderCalibration(void)
 {
-  char line[192];
+  char line[224];
   int32_t abs_left;
   int32_t abs_right;
   int32_t average_counts;
   int32_t new_k_x1000;
+  int32_t step_counts;
   int32_t old_k_x1000 = mapping_encoder_mm_per_count_x1000;
 
   if (!odom_debug_active)
@@ -1651,17 +1655,42 @@ static void TestApp_EndEncoderCalibration(void)
   new_k_x1000 = (ENCODER_CAL_DISTANCE_MM * 1000L) / average_counts;
   mapping_encoder_mm_per_count_x1000 = new_k_x1000;
   mapping_travel_residual_x1000 = 0L;
+  step_counts = (new_k_x1000 > 0L) ?
+      ((AUTO_MAPPING_STEP_DISTANCE_MM * 1000L) / new_k_x1000) :
+      0L;
 
   (void)snprintf(
       line,
       sizeof(line),
-      "ODOM CAL DONE cal_mm=%ld avg=%ld old_k=%ld new_k=%ld lc=%ld rc=%ld persist=ram\r\n",
+      "ODOM CAL DONE cal_mm=%ld delta_l=%ld delta_r=%ld abs_l=%ld abs_r=%ld avg=%ld old_k=%ld new_k=%ld step700_counts=%ld persist=ram\r\n",
       (long)ENCODER_CAL_DISTANCE_MM,
+      (long)odom_debug_left_counts,
+      (long)odom_debug_right_counts,
+      (long)abs_left,
+      (long)abs_right,
       (long)average_counts,
       (long)old_k_x1000,
       (long)new_k_x1000,
+      (long)step_counts);
+  (void)BluetoothControl_SendText(line);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ENCODER RAM UPDATED left_delta=%ld right_delta=%ld avg_counts=%ld mm_per_count_x1000=%ld volatile=1\r\n",
       (long)odom_debug_left_counts,
-      (long)odom_debug_right_counts);
+      (long)odom_debug_right_counts,
+      (long)average_counts,
+      (long)mapping_encoder_mm_per_count_x1000);
+  (void)BluetoothControl_SendText(line);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ENCODER CELL cal_cell=350mm auto_step=700mm step700_counts=%ld left_abs=%ld right_abs=%ld\r\n",
+      (long)step_counts,
+      (long)abs_left,
+      (long)abs_right);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -2160,7 +2189,7 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
   }
 
   if ((point->distance_mm == 0U) ||
-      (point->quality == 0U))
+      (point->quality <= AUTO_MAPPING_MIN_POINT_QUALITY))
   {
     return;
   }
@@ -2304,23 +2333,78 @@ static void TestApp_AutoMappingStartDriveStep(const char *reason)
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL DRIVE reason=%s step=%ld safe=%u pwm=%u\r\n",
+      "AUTO WALL DRIVE reason=%s step=%ld safe=%u pwm=%u k=%ld start_l=%ld start_r=%ld\r\n",
       reason,
       (long)AUTO_MAPPING_STEP_DISTANCE_MM,
       (unsigned int)GetAutoFrontBlockDistanceMm(),
-      (unsigned int)drive_pwm);
+      (unsigned int)drive_pwm,
+      (long)mapping_encoder_mm_per_count_x1000,
+      (long)auto_mapping_step_start_left_counts,
+      (long)auto_mapping_step_start_right_counts);
   (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_AutoMappingGetStepCounts(int32_t *left_counts, int32_t *right_counts, int32_t *average_counts)
+{
+  int32_t left_abs =
+      AppAbs32(encoder_test.left_total - auto_mapping_step_start_left_counts);
+  int32_t right_abs =
+      AppAbs32(encoder_test.right_total - auto_mapping_step_start_right_counts);
+  int32_t average_abs = (left_abs + right_abs) / 2L;
+
+  if (left_counts != NULL)
+  {
+    *left_counts = left_abs;
+  }
+  if (right_counts != NULL)
+  {
+    *right_counts = right_abs;
+  }
+  if (average_counts != NULL)
+  {
+    *average_counts = average_abs;
+  }
 }
 
 static int32_t TestApp_AutoMappingGetStepTravelMm(void)
 {
-  int32_t left_counts =
-      AppAbs32(encoder_test.left_total - auto_mapping_step_start_left_counts);
-  int32_t right_counts =
-      AppAbs32(encoder_test.right_total - auto_mapping_step_start_right_counts);
-  int32_t average_counts = (left_counts + right_counts) / 2L;
+  int32_t average_counts;
 
+  TestApp_AutoMappingGetStepCounts(NULL, NULL, &average_counts);
   return (average_counts * mapping_encoder_mm_per_count_x1000) / 1000L;
+}
+
+static void TestApp_AutoMappingReportStepStop(const char *reason)
+{
+  char line[224];
+  int32_t left_counts;
+  int32_t right_counts;
+  int32_t average_counts;
+
+  if (reason == NULL)
+  {
+    reason = "STOP";
+  }
+
+  TestApp_AutoMappingGetStepCounts(&left_counts, &right_counts, &average_counts);
+  auto_mapping_step_travel_mm =
+      (average_counts * mapping_encoder_mm_per_count_x1000) / 1000L;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "AUTO WALL STEP reason=%s lc=%ld rc=%ld avg=%ld travel=%ld target=%ld k=%ld safe=%u front=%u hold=%u\r\n",
+      reason,
+      (long)left_counts,
+      (long)right_counts,
+      (long)average_counts,
+      (long)auto_mapping_step_travel_mm,
+      (long)AUTO_MAPPING_STEP_DISTANCE_MM,
+      (long)mapping_encoder_mm_per_count_x1000,
+      (unsigned int)GetAutoFrontBlockDistanceMm(),
+      (unsigned int)auto_mapping_front_min_mm,
+      (unsigned int)TestApp_IsAutoFrontBlocked(HAL_GetTick()));
+  (void)BluetoothControl_SendText(line);
 }
 
 static bool TestApp_AutoMappingSectorOpen(uint16_t min_distance_mm)
@@ -2476,6 +2560,7 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
     if (TestApp_IsAutoFrontBlocked(now_ms))
     {
       MotorControl_Stop();
+      TestApp_AutoMappingReportStepStop("FRONT_BLOCKED");
       TestApp_StartAutoObservation("FRONT_BLOCKED");
       return;
     }
@@ -2483,6 +2568,7 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
     if (auto_mapping_step_travel_mm >= AUTO_MAPPING_STEP_DISTANCE_MM)
     {
       MotorControl_Stop();
+      TestApp_AutoMappingReportStepStop("STEP_DONE");
       TestApp_StartAutoObservation("STEP_DONE");
       return;
     }
@@ -2923,8 +3009,7 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */  HAL_Init();
 
   /* USER CODE BEGIN Init */
 

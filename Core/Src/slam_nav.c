@@ -22,8 +22,8 @@
 #define SLAM_NAV_MAX_PWM                1000U
 #define SLAM_NAV_MAX_DRIVE_PWM          420U
 #define SLAM_NAV_MAX_TURN_PWM           390U
-#define SLAM_NAV_MIN_SAFE_MM            350U
-#define SLAM_NAV_NAV_MIN_POINT_QUALITY  20U
+#define SLAM_NAV_MIN_SAFE_MM            0U
+#define SLAM_NAV_NAV_MIN_POINT_QUALITY  25U
 #define SLAM_NAV_MAX_LOCAL_BLOCK_MM     650U
 #define SLAM_NAV_LOCAL_CLEARANCE_MM     150U
 #define SLAM_NAV_MIN_DRIVE_PWM          300U
@@ -53,8 +53,8 @@
 #define SLAM_NAV_TURN_TIMEOUT_MS        6000U
 #define SLAM_NAV_BLOCKED_REPLAN_WAIT_MS 600U
 #define SLAM_NAV_TEMP_BLOCKED_CELLS     12U
-#define SLAM_NAV_TEMP_BLOCK_TTL_MS      5000U
-#define SLAM_NAV_TEMP_BLOCK_LOOKAHEAD_CELLS 2U
+#define SLAM_NAV_TEMP_BLOCK_TTL_MS      2000U
+#define SLAM_NAV_TEMP_BLOCK_LOOKAHEAD_CELLS 1U
 #define SLAM_NAV_SECTOR_STALE_MS        1000U
 #define SLAM_NAV_DIRECTION_BIAS_COUNT   4U
 #define SLAM_NAV_CENTER_GOAL_X_MM       0L
@@ -315,7 +315,6 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
 {
   uint32_t now;
   uint16_t safe_mm;
-  uint16_t local_block_mm;
   uint16_t robot_angle_cdeg;
   uint16_t clearance_mm;
   uint8_t front_block_points;
@@ -351,8 +350,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   safe_mm = s_safe_distance_mm;
   taskEXIT_CRITICAL();
 
-  local_block_mm = SlamNav_LocalBlockDistanceMm(safe_mm);
-  if (clearance_mm > local_block_mm)
+  if (clearance_mm > safe_mm)
   {
     return;
   }
@@ -372,10 +370,6 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
     if (s_front_blocked_since_ms == 0U)
     {
       s_front_blocked_since_ms = now;
-    }
-    if (clearance_mm <= safe_mm)
-    {
-      s_front_blocked_since_ms = now - SLAM_NAV_FRONT_BLOCK_CONFIRM_MS;
     }
     s_front_blocked_until_ms = now + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
     s_front_min_distance_mm = clearance_mm;
@@ -799,27 +793,6 @@ static void SlamNav_UpdateDrive(void)
   taskEXIT_CRITICAL();
 #endif
 
-  if (SlamNav_IsFrontBlocked())
-  {
-    uint32_t now = HAL_GetTick();
-
-    MotorControl_Stop();
-    SlamNav_RecordBlockedAhead(&pose, current_x, current_y);
-#if SLAM_NAV_ENABLE_LOCAL_ESCAPE
-    if ((mode == SLAM_NAV_MODE_EXPLORE) &&
-        SlamNav_TryLocalStep(&pose, current_x, current_y, true, "FRONT_BLOCKED"))
-    {
-      return;
-    }
-#endif
-
-    s_state = SLAM_NAV_STATE_REPLAN;
-    s_state_enter_tick_ms = now;
-    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
-    SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
-    return;
-  }
-
   if (MappingGrid_GetCell(s_current_target_cell.x, s_current_target_cell.y) == MAPPING_GRID_CELL_OCCUPIED)
   {
     MotorControl_Stop();
@@ -850,6 +823,27 @@ static void SlamNav_UpdateDrive(void)
 
     s_state = SLAM_NAV_STATE_PLAN;
     SlamNav_SendStatus("CELL", "REACHED");
+    return;
+  }
+
+  if (SlamNav_IsFrontBlocked())
+  {
+    uint32_t now = HAL_GetTick();
+
+    MotorControl_Stop();
+    SlamNav_RecordBlockedAhead(&pose, current_x, current_y);
+#if SLAM_NAV_ENABLE_LOCAL_ESCAPE
+    if ((mode == SLAM_NAV_MODE_EXPLORE) &&
+        SlamNav_TryLocalStep(&pose, current_x, current_y, true, "FRONT_BLOCKED"))
+    {
+      return;
+    }
+#endif
+
+    s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = now;
+    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+    SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
     return;
   }
 
