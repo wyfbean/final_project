@@ -103,6 +103,8 @@
 #define MODE86_OBSERVE_SECTOR_CDEG 3000U
 #define MODE86_FRONT_BLOCK_HOLD_MS 400U
 #define MODE86_AVG_DISTANCE_NEAR_MM 100U
+#define MODE86_TURN_SIDE_CLEARANCE_MM 320U
+#define MODE86_TURN_DIAGONAL_CLEARANCE_MM 420U
 #define MODE86_HEADING_HOLD_DEADBAND_CDEG 150L
 #define MODE86_HEADING_HOLD_CDEG_PER_PWM  40L
 #define MODE86_HEADING_HOLD_MAX_STEER     70L
@@ -213,6 +215,7 @@ typedef struct
 {
   uint32_t sum_mm;
   uint16_t count;
+  uint16_t min_mm;
 } mode86_sector_stats_t;
 
 static uint16_t adc_buf[ADC_CHANNEL_COUNT];
@@ -271,6 +274,7 @@ static uint16_t auto_mapping_front_blocking_angle_cdeg = 0U;
 static uint16_t auto_mapping_right_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_front_right_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_left_min_mm = UINT16_MAX;
+static uint16_t auto_mapping_front_left_min_mm = UINT16_MAX;
 static uint16_t auto_mapping_right_best_distance_mm = 0U;
 static uint16_t auto_mapping_right_best_angle_cdeg = AUTO_MAPPING_RIGHT_CENTER_CDEG;
 static uint16_t auto_mapping_left_best_distance_mm = 0U;
@@ -297,6 +301,8 @@ static mode86_sector_stats_t mode86_front_stats = {0};
 static mode86_sector_stats_t mode86_right_stats = {0};
 static mode86_sector_stats_t mode86_left_stats = {0};
 static mode86_sector_stats_t mode86_back_stats = {0};
+static mode86_sector_stats_t mode86_front_right_stats = {0};
+static mode86_sector_stats_t mode86_front_left_stats = {0};
 static uint32_t mode86_state_until_ms = 0U;
 static uint32_t mode86_front_blocked_until_ms = 0U;
 static uint32_t last_mode86_control_tick_ms = 0U;
@@ -392,6 +398,9 @@ static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats
 static uint16_t TestApp_Mode86SectorCountLevel(const mode86_sector_stats_t *stats);
 static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
                                        const mode86_sector_stats_t *current_best);
+static bool TestApp_Mode86SectorMinClear(const mode86_sector_stats_t *stats, uint16_t clearance_mm);
+static bool TestApp_Mode86TurnSweepClear(int8_t direction);
+static void TestApp_Mode86SendStats(uint16_t safe_mm, bool right_turn_clear, bool left_turn_clear);
 static bool TestApp_Mode86StepReached(void);
 static bool TestApp_Mode86FrontBlocked(uint32_t now_ms);
 static int32_t TestApp_Mode86HeadingHoldSteer(int32_t error_cdeg);
@@ -2585,6 +2594,16 @@ static void TestApp_UpdateMode86Obstacle(const LidarPoint_t *point)
   {
     TestApp_Mode86AddSectorSample(&mode86_back_stats, point->distance_mm);
   }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_front_right_stats, clearance_mm);
+  }
+
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG))
+  {
+    TestApp_Mode86AddSectorSample(&mode86_front_left_stats, clearance_mm);
+  }
 }
 
 static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
@@ -2687,11 +2706,11 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   uint16_t front_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_front_stats);
   uint16_t right_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_right_stats);
   uint16_t left_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_left_stats);
-  uint16_t back_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_back_stats);
-  uint16_t front_level = TestApp_Mode86SectorCountLevel(&mode86_front_stats);
-  uint16_t right_level = TestApp_Mode86SectorCountLevel(&mode86_right_stats);
-  uint16_t left_level = TestApp_Mode86SectorCountLevel(&mode86_left_stats);
-  uint16_t back_level = TestApp_Mode86SectorCountLevel(&mode86_back_stats);
+  bool right_turn_clear = TestApp_Mode86TurnSweepClear(1);
+  bool left_turn_clear = TestApp_Mode86TurnSweepClear(-1);
+  bool front_too_close = (mode86_front_stats.count > 0U) && (front_avg_mm < safe_mm);
+  bool right_too_close = (mode86_right_stats.count > 0U) && (right_avg_mm < safe_mm);
+  bool left_too_close = (mode86_left_stats.count > 0U) && (left_avg_mm < safe_mm);
   const char *reason = "BEST_FRONT";
   char dir = 'F';
   int8_t turn_direction = 0;
@@ -2710,20 +2729,37 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   if (u_turn_required)
   {
     reason = "ALL_AVG_LT_SAFE";
+  }
+
+  if (!u_turn_required &&
+      front_too_close &&
+      (!right_turn_clear || right_too_close) &&
+      (!left_turn_clear || left_too_close))
+  {
+    u_turn_required = true;
+    reason = "TURN_SWEEP_BLOCKED";
+  }
+
+  TestApp_Mode86SendStats(safe_mm, right_turn_clear, left_turn_clear);
+
+  if (u_turn_required)
+  {
     dir = 'B';
     turn_direction = 1;
     turn_degrees = AUTO_MAPPING_U_TURN_DEG;
   }
   else
   {
-    if (TestApp_Mode86SectorBetter(&mode86_right_stats, best_stats))
+    if (right_turn_clear &&
+        TestApp_Mode86SectorBetter(&mode86_right_stats, best_stats))
     {
       best_stats = &mode86_right_stats;
       reason = "BEST_RIGHT";
       dir = 'R';
     }
 
-    if (TestApp_Mode86SectorBetter(&mode86_left_stats, best_stats))
+    if (left_turn_clear &&
+        TestApp_Mode86SectorBetter(&mode86_left_stats, best_stats))
     {
       best_stats = &mode86_left_stats;
       reason = "BEST_LEFT";
@@ -2747,20 +2783,8 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     (void)snprintf(
         line,
         sizeof(line),
-        "MODE86 DECIDE dir=F reason=%s dirs=F,R,L,B avg=%u,%u,%u,%u count=%u,%u,%u,%u level=%u,%u,%u,%u safe=%u turns=%lu\r\n",
+        "MODE86 DECIDE dir=F reason=%s safe=%u turns=%lu\r\n",
         reason,
-        (unsigned int)front_avg_mm,
-        (unsigned int)right_avg_mm,
-        (unsigned int)left_avg_mm,
-        (unsigned int)back_avg_mm,
-        (unsigned int)mode86_front_stats.count,
-        (unsigned int)mode86_right_stats.count,
-        (unsigned int)mode86_left_stats.count,
-        (unsigned int)mode86_back_stats.count,
-        (unsigned int)front_level,
-        (unsigned int)right_level,
-        (unsigned int)left_level,
-        (unsigned int)back_level,
         (unsigned int)safe_mm,
         (unsigned long)mode86_turn_count);
     (void)BluetoothControl_SendText(line);
@@ -2786,21 +2810,9 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
   (void)snprintf(
       line,
       sizeof(line),
-      "MODE86 DECIDE dir=%c reason=%s dirs=F,R,L,B avg=%u,%u,%u,%u count=%u,%u,%u,%u level=%u,%u,%u,%u safe=%u target=%ld turns=%lu\r\n",
+      "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld turns=%lu\r\n",
       dir,
       reason,
-      (unsigned int)front_avg_mm,
-      (unsigned int)right_avg_mm,
-      (unsigned int)left_avg_mm,
-      (unsigned int)back_avg_mm,
-      (unsigned int)mode86_front_stats.count,
-      (unsigned int)mode86_right_stats.count,
-      (unsigned int)mode86_left_stats.count,
-      (unsigned int)mode86_back_stats.count,
-      (unsigned int)front_level,
-      (unsigned int)right_level,
-      (unsigned int)left_level,
-      (unsigned int)back_level,
       (unsigned int)safe_mm,
       (long)target_heading_cdeg,
       (unsigned long)mode86_turn_count);
@@ -2813,12 +2825,22 @@ static void TestApp_ResetMode86SectorStats(void)
 {
   mode86_front_stats.sum_mm = 0U;
   mode86_front_stats.count = 0U;
+  mode86_front_stats.min_mm = UINT16_MAX;
   mode86_right_stats.sum_mm = 0U;
   mode86_right_stats.count = 0U;
+  mode86_right_stats.min_mm = UINT16_MAX;
   mode86_left_stats.sum_mm = 0U;
   mode86_left_stats.count = 0U;
+  mode86_left_stats.min_mm = UINT16_MAX;
   mode86_back_stats.sum_mm = 0U;
   mode86_back_stats.count = 0U;
+  mode86_back_stats.min_mm = UINT16_MAX;
+  mode86_front_right_stats.sum_mm = 0U;
+  mode86_front_right_stats.count = 0U;
+  mode86_front_right_stats.min_mm = UINT16_MAX;
+  mode86_front_left_stats.sum_mm = 0U;
+  mode86_front_left_stats.count = 0U;
+  mode86_front_left_stats.min_mm = UINT16_MAX;
 }
 
 static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t distance_mm)
@@ -2830,6 +2852,10 @@ static void TestApp_Mode86AddSectorSample(mode86_sector_stats_t *stats, uint16_t
 
   stats->sum_mm += distance_mm;
   stats->count++;
+  if (distance_mm < stats->min_mm)
+  {
+    stats->min_mm = distance_mm;
+  }
 }
 
 static uint16_t TestApp_Mode86SectorAverageMm(const mode86_sector_stats_t *stats)
@@ -2878,6 +2904,63 @@ static bool TestApp_Mode86SectorBetter(const mode86_sector_stats_t *candidate,
   }
 
   return candidate_avg > best_avg;
+}
+
+static bool TestApp_Mode86SectorMinClear(const mode86_sector_stats_t *stats, uint16_t clearance_mm)
+{
+  if ((stats == NULL) || (stats->count == 0U))
+  {
+    return true;
+  }
+
+  return stats->min_mm >= clearance_mm;
+}
+
+static bool TestApp_Mode86TurnSweepClear(int8_t direction)
+{
+  if (direction > 0)
+  {
+    return TestApp_Mode86SectorMinClear(&mode86_right_stats, MODE86_TURN_SIDE_CLEARANCE_MM) &&
+        TestApp_Mode86SectorMinClear(&mode86_front_right_stats, MODE86_TURN_DIAGONAL_CLEARANCE_MM);
+  }
+
+  if (direction < 0)
+  {
+    return TestApp_Mode86SectorMinClear(&mode86_left_stats, MODE86_TURN_SIDE_CLEARANCE_MM) &&
+        TestApp_Mode86SectorMinClear(&mode86_front_left_stats, MODE86_TURN_DIAGONAL_CLEARANCE_MM);
+  }
+
+  return true;
+}
+
+static void TestApp_Mode86SendStats(uint16_t safe_mm, bool right_turn_clear, bool left_turn_clear)
+{
+  char line[256];
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MODE86 STATS d=F,R,L,B avg=%u,%u,%u,%u cnt=%u,%u,%u,%u min=%u,%u,%u,%u diag=FR,FL dmin=%u,%u dcnt=%u,%u gate=%u,%u safe=%u\r\n",
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_front_stats),
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_right_stats),
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_left_stats),
+      (unsigned int)TestApp_Mode86SectorAverageMm(&mode86_back_stats),
+      (unsigned int)mode86_front_stats.count,
+      (unsigned int)mode86_right_stats.count,
+      (unsigned int)mode86_left_stats.count,
+      (unsigned int)mode86_back_stats.count,
+      (unsigned int)mode86_front_stats.min_mm,
+      (unsigned int)mode86_right_stats.min_mm,
+      (unsigned int)mode86_left_stats.min_mm,
+      (unsigned int)mode86_back_stats.min_mm,
+      (unsigned int)mode86_front_right_stats.min_mm,
+      (unsigned int)mode86_front_left_stats.min_mm,
+      (unsigned int)mode86_front_right_stats.count,
+      (unsigned int)mode86_front_left_stats.count,
+      (unsigned int)right_turn_clear,
+      (unsigned int)left_turn_clear,
+      (unsigned int)safe_mm);
+  (void)BluetoothControl_SendText(line);
 }
 
 static bool TestApp_Mode86StepReached(void)
@@ -3047,6 +3130,12 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
     auto_mapping_front_right_min_mm = clearance_mm;
   }
 
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) &&
+      (clearance_mm < auto_mapping_front_left_min_mm))
+  {
+    auto_mapping_front_left_min_mm = clearance_mm;
+  }
+
   if ((TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
        TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG)) &&
       (point->distance_mm > auto_mapping_right_best_distance_mm))
@@ -3107,6 +3196,7 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   uint16_t side_open_mm;
   uint16_t right_open_mm;
   uint16_t front_right_open_mm;
+  uint16_t front_left_open_mm;
   uint16_t right_wall_seen_mm;
   uint16_t drive_pwm;
   bool front_open;
@@ -3114,8 +3204,10 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   bool right_seen;
   bool front_right_seen;
   bool left_seen;
+  bool front_left_seen;
   bool right_open;
   bool front_right_open;
+  bool front_left_open;
   bool left_open;
   bool right_turn_candidate;
 
@@ -3170,6 +3262,7 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   {
     front_right_open_mm = AUTO_MAPPING_MIN_FRONT_RIGHT_OPEN_MM;
   }
+  front_left_open_mm = front_right_open_mm;
   right_wall_seen_mm = (uint16_t)(safe_mm + AUTO_MAPPING_RIGHT_WALL_MARGIN_MM);
   front_blocked = TestApp_IsAutoFrontBlocked(now_ms);
   front_open = !front_blocked &&
@@ -3177,9 +3270,11 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   right_seen = (auto_mapping_right_min_mm != UINT16_MAX);
   front_right_seen = (auto_mapping_front_right_min_mm != UINT16_MAX);
   left_seen = (auto_mapping_left_min_mm != UINT16_MAX);
+  front_left_seen = (auto_mapping_front_left_min_mm != UINT16_MAX);
   right_open = right_seen && (auto_mapping_right_min_mm > right_open_mm);
   front_right_open = front_right_seen && (auto_mapping_front_right_min_mm > front_right_open_mm);
-  left_open = left_seen && (auto_mapping_left_min_mm > side_open_mm);
+  front_left_open = !front_left_seen || (auto_mapping_front_left_min_mm > front_left_open_mm);
+  left_open = left_seen && front_left_open && (auto_mapping_left_min_mm > side_open_mm);
 
   if (right_seen && (auto_mapping_right_min_mm <= right_wall_seen_mm))
   {
@@ -3241,6 +3336,7 @@ static void TestApp_ResetAutoMappingSectorMins(void)
   auto_mapping_right_min_mm = UINT16_MAX;
   auto_mapping_front_right_min_mm = UINT16_MAX;
   auto_mapping_left_min_mm = UINT16_MAX;
+  auto_mapping_front_left_min_mm = UINT16_MAX;
   auto_mapping_right_best_distance_mm = 0U;
   auto_mapping_right_best_angle_cdeg = AUTO_MAPPING_RIGHT_CENTER_CDEG;
   auto_mapping_left_best_distance_mm = 0U;
@@ -3332,7 +3428,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u wall=%u conf=%u count=%lu\r\n",
+      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u fl=%u wall=%u conf=%u count=%lu\r\n",
       reason,
       (direction < 0) ? 'L' : 'R',
       (unsigned int)degrees,
@@ -3345,6 +3441,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
       (unsigned int)auto_mapping_right_min_mm,
       (unsigned int)auto_mapping_front_right_min_mm,
       (unsigned int)auto_mapping_left_min_mm,
+      (unsigned int)auto_mapping_front_left_min_mm,
       (unsigned int)auto_mapping_right_wall_seen,
       (unsigned int)auto_mapping_right_branch_confirm_count,
       (unsigned long)auto_mapping_avoid_count);
