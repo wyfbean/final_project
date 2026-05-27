@@ -149,7 +149,7 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
   }
 
   world_angle_cdeg = MappingGrid_NormalizeAngleCdeg(
-      pose->heading_cdeg + LidarPipeline_LidarToRobotAngleCdeg(angle_cdeg));
+      pose->heading_cdeg - LidarPipeline_LidarToRobotAngleCdeg(angle_cdeg));
   angle_rad = MappingGrid_CdegToRadians(world_angle_cdeg);
   hit_world_x_mm = pose->x_mm + (int32_t)((float)distance_mm * cosf(angle_rad));
   hit_world_y_mm = pose->y_mm + (int32_t)((float)distance_mm * sinf(angle_rad));
