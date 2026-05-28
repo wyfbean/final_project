@@ -76,7 +76,8 @@
 #define AUTO_MAPPING_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
 #define AUTO_MAPPING_MIN_SAFE_MM    50U
 #define AUTO_MAPPING_MAX_SAFE_MM    2000U
-#define OBSTACLE_SAFE_DEFAULT_MM    350U
+#define OBSTACLE_SAFE_DEFAULT_MM    400U
+#define OBSTACLE_SAFE_STEP_MM       50U
 #define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
@@ -110,7 +111,7 @@
 #define MODE86_QUALITY_LEVEL_UNIT 500U
 #define MODE86_HEADING_HOLD_DEADBAND_CDEG 150L
 #define MODE86_HEADING_HOLD_CDEG_PER_PWM  40L
-#define MODE86_HEADING_HOLD_MAX_STEER     70L
+#define MODE86_HEADING_HOLD_MAX_STEER     30L
 #define MANUAL_HEADING_HOLD_DEADBAND_CDEG 150L
 #define MANUAL_HEADING_HOLD_CDEG_PER_PWM  40L
 #define MANUAL_HEADING_HOLD_MAX_STEER     80L
@@ -252,6 +253,15 @@ static bool lidar_result_valid = false;
 static bool mapping_active = false;
 static bool lidar_debug_active = false;
 static bool odom_debug_active = false;
+static bool encoder_scale_cal_active = false;
+static int32_t encoder_scale_cal_left = 0L;
+static int32_t encoder_scale_cal_right = 0L;
+static bool encoder_debug_drive_active = false;
+static int32_t encoder_debug_start_left = 0L;
+static int32_t encoder_debug_start_right = 0L;
+static uint32_t encoder_debug_start_tick_ms = 0U;
+#define ENCODER_DEBUG_DRIVE_MM      350U
+#define ENCODER_DEBUG_TIMEOUT_MS    10000U
 static bool auto_mapping_active = false;
 static LidarParseResult_t lidar_result = {0};
 static Mpu6500State_t mpu_state = {0};
@@ -271,6 +281,7 @@ static int32_t odom_debug_right_counts = 0L;
 static int32_t odom_debug_heading_cdeg = 0L;
 static int32_t mapping_encoder_mm_per_count_x1000 = MAPPING_ENCODER_MM_PER_COUNT_X1000;
 static int32_t gyro_z_bias_dps_x100 = 0L;
+static int32_t gyro_z_scale_num_x1000 = 1138L;
 static int32_t gyro_z_corrected_dps_x100 = 0L;
 static uint8_t gyro_bias_stationary_samples = 0U;
 static MappingGridPose_t mapping_pose_history[MAPPING_POSE_HISTORY_LENGTH];
@@ -454,6 +465,10 @@ static void TestApp_RequestFullMapStream(void);
 static void TestApp_SendMapHeader(const char *state);
 static void TestApp_SendMapStat(void);
 static void TestApp_SendMpuState(void);
+static void TestApp_SetGyroScaleFactor(const char *text);
+static void TestApp_SetEncoderScaleFactor(const char *text);
+static void TestApp_StartEncoderDebugDrive(void);
+static void TestApp_UpdateEncoderDebugDrive(uint32_t now_ms);
 static void TestApp_ResetMapNorth(void);
 static void TestApp_SendDirState(void);
 static void TestApp_FormatEncoderTelemetry(char *buffer, size_t buffer_size);
@@ -907,6 +922,10 @@ static void TestApp_UpdateGyroDriftCompensation(int16_t left_delta, int16_t righ
   }
 
   gyro_z_corrected_dps_x100 = raw_gyro - gyro_z_bias_dps_x100;
+  if (gyro_z_scale_num_x1000 != 1000L)
+  {
+    gyro_z_corrected_dps_x100 = (gyro_z_corrected_dps_x100 * gyro_z_scale_num_x1000) / 1000L;
+  }
   if (AppAbs32(gyro_z_corrected_dps_x100) <= GYRO_DEADBAND_DPS_X100)
   {
     gyro_z_corrected_dps_x100 = 0L;
@@ -1153,6 +1172,12 @@ static void TestApp_UpdateSensors(void)
   encoder_test.last_left_counter = left_now;
   encoder_test.last_right_counter = right_now;
 
+  if (encoder_scale_cal_active)
+  {
+    encoder_scale_cal_left  += (int32_t)encoder_test.left_delta;
+    encoder_scale_cal_right += (int32_t)encoder_test.right_delta;
+  }
+
   TestApp_UpdateGyroCalibration(now, encoder_test.left_delta, encoder_test.right_delta);
   TestApp_UpdateGyroDriftCompensation(encoder_test.left_delta, encoder_test.right_delta);
   TestApp_UpdateOdomDebug(now, encoder_test.left_delta, encoder_test.right_delta);
@@ -1163,6 +1188,7 @@ static void TestApp_UpdateSensors(void)
   TestApp_UpdateManualHeadingHold();
   TestApp_UpdateAutoMapping(now);
   TestApp_UpdateMode86(now);
+  TestApp_UpdateEncoderDebugDrive(now);
   TestApp_UpdateMotorSpeedFromAdc();
 }
 
@@ -1216,6 +1242,44 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_SAFE_END:
         TestApp_EndObstacleSafeDistanceSet();
         break;
+
+      case BLUETOOTH_CMD_SAFE_UP:
+      {
+        char safe_line[64];
+        uint16_t cur = GetObstacleSafeDistanceMm();
+        uint16_t next = (uint16_t)(cur + OBSTACLE_SAFE_STEP_MM);
+        if (next > AUTO_MAPPING_MAX_SAFE_MM)
+        {
+          next = AUTO_MAPPING_MAX_SAFE_MM;
+        }
+        obstacle_safe_distance_mm = next;
+        SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
+        (void)snprintf(safe_line, sizeof(safe_line),
+                       "SAFE UP safe=%u step=%u max=%u\r\n",
+                       (unsigned int)GetObstacleSafeDistanceMm(),
+                       (unsigned int)OBSTACLE_SAFE_STEP_MM,
+                       (unsigned int)AUTO_MAPPING_MAX_SAFE_MM);
+        (void)BluetoothControl_SendText(safe_line);
+        break;
+      }
+
+      case BLUETOOTH_CMD_SAFE_DOWN:
+      {
+        char safe_line[64];
+        uint16_t cur = GetObstacleSafeDistanceMm();
+        uint16_t next = (cur > AUTO_MAPPING_MIN_SAFE_MM + OBSTACLE_SAFE_STEP_MM)
+            ? (uint16_t)(cur - OBSTACLE_SAFE_STEP_MM)
+            : AUTO_MAPPING_MIN_SAFE_MM;
+        obstacle_safe_distance_mm = next;
+        SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
+        (void)snprintf(safe_line, sizeof(safe_line),
+                       "SAFE DOWN safe=%u step=%u min=%u\r\n",
+                       (unsigned int)GetObstacleSafeDistanceMm(),
+                       (unsigned int)OBSTACLE_SAFE_STEP_MM,
+                       (unsigned int)AUTO_MAPPING_MIN_SAFE_MM);
+        (void)BluetoothControl_SendText(safe_line);
+        break;
+      }
 
       case BLUETOOTH_CMD_DRIVE_FORWARD:
         SlamNav_Stop();
@@ -1312,6 +1376,19 @@ static void TestApp_HandleBluetoothCommands(void)
         TestApp_EndEncoderCalibration();
         break;
 
+      case BLUETOOTH_CMD_ENCODER_SCALE_SET:
+        TestApp_SetEncoderScaleFactor(command.text);
+        break;
+
+      case BLUETOOTH_CMD_ENCODER_DEBUG:
+        SlamNav_Stop();
+        TestApp_StopAutoMapping();
+        TestApp_StopMode86();
+        TestApp_StopAngleTurn(false);
+        TestApp_StopManualHeadingHold();
+        TestApp_StartEncoderDebugDrive();
+        break;
+
       case BLUETOOTH_CMD_AUTO_MAPPING_ON:
         SlamNav_Stop();
         TestApp_StopMode86();
@@ -1392,6 +1469,10 @@ static void TestApp_HandleBluetoothCommands(void)
 
       case BLUETOOTH_CMD_MPU_STATE:
         TestApp_SendMpuState();
+        break;
+
+      case BLUETOOTH_CMD_GYRO_SCALE_SET:
+        TestApp_SetGyroScaleFactor(command.text);
         break;
 
       case BLUETOOTH_CMD_LIDAR_FRONT_STATE:
@@ -2254,7 +2335,9 @@ static bool TestApp_IsObstacleSafeCommand(BluetoothCommandType_t command)
 {
   return (command == BLUETOOTH_CMD_SAFE_SET) ||
       (command == BLUETOOTH_CMD_SAFE_VALUE) ||
-      (command == BLUETOOTH_CMD_SAFE_END);
+      (command == BLUETOOTH_CMD_SAFE_END) ||
+      (command == BLUETOOTH_CMD_SAFE_UP) ||
+      (command == BLUETOOTH_CMD_SAFE_DOWN);
 }
 
 static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
@@ -2870,6 +2953,20 @@ static void TestApp_Mode86StartDrive(const char *reason, uint32_t now_ms)
       ((reason != NULL) && (strcmp(reason, "AFTER_TURN") == 0));
   TestApp_ResetMode86SectorStats();
 
+  /* If the heading error to target exceeds the heading-hold effective range
+     (>20°), re-snap the drive target to the nearest axis from the actual
+     current heading.  This prevents the heading hold from saturating at
+     max steer from the very first control tick, which would cause a
+     dangerous arcing trajectory. */
+  {
+    int32_t heading_err = AppAbs32(TestApp_SignedHeadingErrorCdeg(
+        mode86_target_heading_cdeg, mapping_pose.heading_cdeg));
+    if (heading_err > 2000L)
+    {
+      mode86_target_heading_cdeg = TestApp_SnapHeadingToMazeAxis(mapping_pose.heading_cdeg);
+    }
+  }
+
   if (reason == NULL)
   {
     reason = "DRIVE";
@@ -2958,71 +3055,75 @@ static void TestApp_Mode86StartObservation(const char *reason, uint32_t now_ms)
 
 static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
 {
-  const mode86_sector_stats_t *best_stats = &mode86_front_stats;
   uint16_t safe_mm = GetMode86SafeDistanceMm();
-  uint16_t front_avg_mm = TestApp_Mode86SectorAverageMm(&mode86_front_stats);
-  int32_t front_score = (int32_t)front_avg_mm;
-  int32_t right_score = TestApp_Mode86TurnScore(1);
-  int32_t left_score = TestApp_Mode86TurnScore(-1);
-  int32_t best_score = front_score;
-  const char *reason = "BEST_FRONT";
-  char dir = 'F';
+  uint16_t front_avg_mm;
+  uint16_t left_avg_mm;
+  uint16_t right_avg_mm;
+  bool front_passable;
+  bool left_passable;
+  bool right_passable;
+  const char *reason;
+  char dir;
   int8_t turn_direction = 0;
   uint16_t turn_degrees = 0U;
-  int32_t turn_step_cdeg = 0L;
   int32_t target_heading_cdeg = mode86_target_heading_cdeg;
-  bool u_turn_required =
-      (mode86_front_stats.count > 0U) &&
-      (mode86_right_stats.count > 0U) &&
-      (mode86_left_stats.count > 0U) &&
-      (front_score < (int32_t)safe_mm) &&
-      (right_score < (int32_t)safe_mm) &&
-      (left_score < (int32_t)safe_mm);
   char line[256];
   char enc[64];
 
-  if (u_turn_required)
-  {
-    reason = "ALL_AVG_LT_SAFE";
-  }
+  /* Measure per-sector clearance.  count==0 means the lidar had no reading in
+     that sector during the observation window → treat as passable (clear). */
+  front_avg_mm   = TestApp_Mode86SectorAverageMm(&mode86_front_stats);
+  left_avg_mm    = TestApp_Mode86SectorAverageMm(&mode86_left_stats);
+  right_avg_mm   = TestApp_Mode86SectorAverageMm(&mode86_right_stats);
+
+  front_passable = (mode86_front_stats.count == 0U) || (front_avg_mm > safe_mm);
+  left_passable  = (mode86_left_stats.count  == 0U) || (left_avg_mm  > safe_mm);
+  right_passable = (mode86_right_stats.count == 0U) || (right_avg_mm > safe_mm);
 
   TestApp_FormatEncoderTelemetry(enc, sizeof(enc));
-  TestApp_Mode86SendStats(safe_mm, front_score, right_score, left_score);
+  TestApp_Mode86SendStats(safe_mm,
+                          (int32_t)front_avg_mm,
+                          (int32_t)right_avg_mm,
+                          (int32_t)left_avg_mm);
 
-  if (u_turn_required)
+  /* Decision table (priority order):
+     1. Front + left + right all blocked  → U-turn (180°)
+     2. Left and right both blocked       → go straight (front is open)
+     3. Left blocked, right open          → turn right (90°)
+     4. Left open, right blocked          → turn left (90°)
+     5. Both open                         → prefer left (90°) */
+  if (!front_passable && !left_passable && !right_passable)
   {
     dir = 'B';
     turn_direction = 1;
     turn_degrees = AUTO_MAPPING_U_TURN_DEG;
+    reason = "ALL_BLOCKED";
+  }
+  else if (!left_passable && !right_passable)
+  {
+    dir = 'F';
+    reason = "LR_BLOCKED";
+  }
+  else if (!left_passable)
+  {
+    dir = 'R';
+    turn_direction = 1;
+    turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    reason = "LEFT_BLOCKED";
+  }
+  else if (!right_passable)
+  {
+    dir = 'L';
+    turn_direction = -1;
+    turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    reason = "RIGHT_BLOCKED";
   }
   else
   {
-    if (TestApp_Mode86ScoreBetter(right_score, &mode86_right_stats, best_score, best_stats))
-    {
-      best_stats = &mode86_right_stats;
-      best_score = right_score;
-      reason = "BEST_RIGHT";
-      dir = 'R';
-    }
-
-    if (TestApp_Mode86ScoreBetter(left_score, &mode86_left_stats, best_score, best_stats))
-    {
-      best_stats = &mode86_left_stats;
-      best_score = left_score;
-      reason = "BEST_LEFT";
-      dir = 'L';
-    }
-
-    if (dir == 'R')
-    {
-      turn_direction = 1;
-      turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
-    }
-    else if (dir == 'L')
-    {
-      turn_direction = -1;
-      turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
-    }
+    dir = 'L';
+    turn_direction = -1;
+    turn_degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    reason = "PREFER_LEFT";
   }
 
   if (dir == 'F')
@@ -3030,9 +3131,12 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     (void)snprintf(
         line,
         sizeof(line),
-        "MODE86 DECIDE dir=F reason=%s safe=%u turns=%lu%s\r\n",
+        "MODE86 DECIDE dir=F reason=%s safe=%u f=%u l=%u r=%u turns=%lu%s\r\n",
         reason,
         (unsigned int)safe_mm,
+        (unsigned int)front_avg_mm,
+        (unsigned int)left_avg_mm,
+        (unsigned int)right_avg_mm,
         (unsigned long)mode86_turn_count,
         enc);
     (void)BluetoothControl_SendText(line);
@@ -3040,9 +3144,7 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     return;
   }
 
-  /* Use axis-snapped target: snap current heading to nearest 90° axis first,
-     then add the turn step. This mirrors auto-mapping logic and prevents
-     diagonal drift from accumulating across multiple turns. */
+  /* Execute turn with axis-snapped target heading */
   {
     int32_t snapped_error_cdeg;
     uint16_t snapped_degrees;
@@ -3068,10 +3170,13 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     (void)snprintf(
         line,
         sizeof(line),
-        "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld snap_deg=%u turns=%lu%s\r\n",
+        "MODE86 DECIDE dir=%c reason=%s safe=%u f=%u l=%u r=%u target=%ld snap_deg=%u turns=%lu%s\r\n",
         dir,
         reason,
         (unsigned int)safe_mm,
+        (unsigned int)front_avg_mm,
+        (unsigned int)left_avg_mm,
+        (unsigned int)right_avg_mm,
         (long)target_heading_cdeg,
         (unsigned int)snapped_degrees,
         (unsigned long)mode86_turn_count,
@@ -3955,16 +4060,226 @@ static void TestApp_SendMpuState(void)
   (void)snprintf(
       line,
       sizeof(line),
-      "MPU STATE ready=%u who=%02X raw=%d gz=%ld bias=%ld corr=%ld heading=%ld map=%u cal=%u\r\n",
+      "MPU STATE ready=%u who=%02X raw=%d gz=%ld bias=%ld scale=%ld corr=%ld heading=%ld map=%u cal=%u\r\n",
       (unsigned int)mpu_state.ready,
       (unsigned int)mpu_state.who_am_i,
       (int)mpu_state.gyro_z_raw,
       (long)mpu_state.gyro_z_dps_x100,
       (long)gyro_z_bias_dps_x100,
+      (long)gyro_z_scale_num_x1000,
       (long)gyro_z_corrected_dps_x100,
       (long)mapping_pose.heading_cdeg,
       (unsigned int)mapping_active,
       (unsigned int)gyro_calibration_active);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_SetGyroScaleFactor(const char *text)
+{
+  const char *p = text;
+  uint32_t value = 0U;
+  bool has_digit = false;
+  char line[96];
+
+  if (p == NULL)
+  {
+    return;
+  }
+
+  while ((*p != '\0') && ((*p < '0') || (*p > '9')))
+  {
+    p++;
+  }
+
+  while (*p != '\0')
+  {
+    if ((*p >= '0') && (*p <= '9'))
+    {
+      has_digit = true;
+      value = (value * 10U) + (uint32_t)(*p - '0');
+      if (value > 2000U)
+      {
+        value = 2000U;
+        break;
+      }
+    }
+    p++;
+  }
+
+  if (!has_digit || (value < 500U) || (value > 2000U))
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "GYRO SCALE ERR val=%lu range=500..2000 current=%ld\r\n",
+        (unsigned long)value,
+        (long)gyro_z_scale_num_x1000);
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  gyro_z_scale_num_x1000 = (int32_t)value;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "GYRO SCALE OK scale=%ld.%03ld heading=%ld\r\n",
+      (long)(gyro_z_scale_num_x1000 / 1000L),
+      (long)(gyro_z_scale_num_x1000 % 1000L),
+      (long)mapping_pose.heading_cdeg);
+  (void)BluetoothControl_SendText(line);
+}
+
+/* ES xxxx  — set encoder mm-per-count scale directly (range 10..500).
+   Calibration procedure:
+     1. Send "94" (ODOM ON) to reset count tracking
+     2. Drive straight ~350 mm
+     3. Read reported dist from ODOM telemetry
+     4. Compute new_k = current_k * 350 / reported_dist_mm
+     5. Send "ES new_k" to apply */
+/* ES xxx  — set encoder mm-per-count scale directly (range 10..2000).
+   Calibration procedure:
+     1. Send "ENCODER DEBUG" (ED) → robot drives 350mm then stops
+     2. Measure the real physical distance (e.g. 320mm)
+     3. Compute new_k = old_k × 350 / actual_mm
+     4. Send "ES new_k" to apply */
+static void TestApp_SetEncoderScaleFactor(const char *text)
+{
+  const char *p = text;
+  uint32_t value = 0U;
+  bool has_digit = false;
+  char line[128];
+  int32_t old_k = mapping_encoder_mm_per_count_x1000;
+
+  if (p == NULL)
+  {
+    return;
+  }
+
+  while ((*p != '\0') && ((*p < '0') || (*p > '9')))
+  {
+    p++;
+  }
+
+  while (*p != '\0')
+  {
+    if ((*p >= '0') && (*p <= '9'))
+    {
+      has_digit = true;
+      value = (value * 10U) + (uint32_t)(*p - '0');
+      if (value > 2000U)
+      {
+        value = 2000U;
+        break;
+      }
+    }
+    p++;
+  }
+
+  if (!has_digit)
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "ES STATE k=%ld hint_new_k=old_k*350/actual_mm\r\n",
+        (long)mapping_encoder_mm_per_count_x1000);
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  if ((value < 10U) || (value > 2000U))
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "ES ERR val=%lu range=10..2000 current=%ld\r\n",
+        (unsigned long)value,
+        (long)mapping_encoder_mm_per_count_x1000);
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  mapping_encoder_mm_per_count_x1000 = (int32_t)value;
+  mapping_travel_residual_x1000 = 0L;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ES OK old_k=%ld new_k=%ld\r\n",
+      (long)old_k,
+      (long)mapping_encoder_mm_per_count_x1000);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_StartEncoderDebugDrive(void)
+{
+  char line[128];
+  uint32_t now = HAL_GetTick();
+  uint16_t drive_pwm = ClampPwmPermille(GetDrivePwmPermille(), AUTO_MAPPING_MAX_DRIVE_PWM);
+
+  encoder_debug_drive_active = true;
+  encoder_debug_start_left   = encoder_test.left_total;
+  encoder_debug_start_right  = encoder_test.right_total;
+  encoder_debug_start_tick_ms = now;
+
+  MotorControl_SetForward(drive_pwm);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ENCODER DEBUG START target=%umm k=%ld pwm=%u timeout=%ums\r\n",
+      (unsigned int)ENCODER_DEBUG_DRIVE_MM,
+      (long)mapping_encoder_mm_per_count_x1000,
+      (unsigned int)drive_pwm,
+      (unsigned int)ENCODER_DEBUG_TIMEOUT_MS);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_UpdateEncoderDebugDrive(uint32_t now_ms)
+{
+  int32_t left_traveled;
+  int32_t right_traveled;
+  int32_t avg_counts;
+  int32_t dist_mm;
+  int32_t target_counts;
+  char line[128];
+
+  if (!encoder_debug_drive_active)
+  {
+    return;
+  }
+
+  /* Timeout safety stop */
+  if ((now_ms - encoder_debug_start_tick_ms) >= ENCODER_DEBUG_TIMEOUT_MS)
+  {
+    encoder_debug_drive_active = false;
+    MotorControl_Stop();
+    (void)BluetoothControl_SendText("ENCODER DEBUG TIMEOUT stopped\r\n");
+    return;
+  }
+
+  left_traveled  = AppAbs32(encoder_test.left_total  - encoder_debug_start_left);
+  right_traveled = AppAbs32(encoder_test.right_total - encoder_debug_start_right);
+  avg_counts     = (left_traveled + right_traveled) / 2L;
+  dist_mm        = (avg_counts * mapping_encoder_mm_per_count_x1000) / 1000L;
+
+  target_counts = ((int32_t)ENCODER_DEBUG_DRIVE_MM * 1000L) / mapping_encoder_mm_per_count_x1000;
+
+  if (avg_counts < target_counts)
+  {
+    return;
+  }
+
+  encoder_debug_drive_active = false;
+  MotorControl_Stop();
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ENCODER DEBUG DONE odom_mm=%ld avg_counts=%ld k=%ld measure_real_then_ES_new_k\r\n",
+      (long)dist_mm,
+      (long)avg_counts,
+      (long)mapping_encoder_mm_per_count_x1000);
   (void)BluetoothControl_SendText(line);
 }
 

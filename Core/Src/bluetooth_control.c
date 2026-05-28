@@ -437,9 +437,13 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_SAFE_SET:        return "SAFE_SET";
     case BLUETOOTH_CMD_SAFE_VALUE:      return "SAFE_VALUE";
     case BLUETOOTH_CMD_SAFE_END:        return "SAFE_END";
+    case BLUETOOTH_CMD_SAFE_UP:         return "SAFE_UP";
+    case BLUETOOTH_CMD_SAFE_DOWN:       return "SAFE_DOWN";
     case BLUETOOTH_CMD_ODOM_DEBUG_ON:   return "ODOM_DEBUG_ON";
     case BLUETOOTH_CMD_ODOM_DEBUG_OFF:  return "ODOM_DEBUG_OFF";
-    case BLUETOOTH_CMD_ENCODER_CAL_END: return "ENCODER_CAL_END";
+    case BLUETOOTH_CMD_ENCODER_CAL_END:   return "ENCODER_CAL_END";
+    case BLUETOOTH_CMD_ENCODER_SCALE_SET: return "ENCODER_SCALE_SET";
+    case BLUETOOTH_CMD_ENCODER_DEBUG:     return "ENCODER_DEBUG";
     case BLUETOOTH_CMD_AUTO_MAPPING_ON: return "AUTO_MAPPING_ON";
     case BLUETOOTH_CMD_AUTO_MAPPING_OFF:return "AUTO_MAPPING_OFF";
     case BLUETOOTH_CMD_MODE86_ON:       return "MODE86_ON";
@@ -458,6 +462,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_TURN_LEFT:       return "TURN_LEFT";
     case BLUETOOTH_CMD_TURN_RIGHT:      return "TURN_RIGHT";
     case BLUETOOTH_CMD_DRIVE_STOP:      return "DRIVE_STOP";
+    case BLUETOOTH_CMD_GYRO_SCALE_SET:  return "GYRO_SCALE_SET";
     case BLUETOOTH_CMD_UNKNOWN:         return "UNKNOWN";
     case BLUETOOTH_CMD_NONE:
     default:                            return "NONE";
@@ -696,6 +701,22 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_SAFE_END;
   }
 
+  if ((strcmp(line, "SAFEUP") == 0) ||
+      (strcmp(line, "SAFE UP") == 0) ||
+      (strcmp(line, "SU") == 0))
+  {
+    s_safe_set_capture_active = false;
+    return BLUETOOTH_CMD_SAFE_UP;
+  }
+
+  if ((strcmp(line, "SAFEDOWN") == 0) ||
+      (strcmp(line, "SAFE DOWN") == 0) ||
+      (strcmp(line, "SD") == 0))
+  {
+    s_safe_set_capture_active = false;
+    return BLUETOOTH_CMD_SAFE_DOWN;
+  }
+
   if (s_safe_set_capture_active && BluetoothControl_IsUnsignedNumber(line))
   {
     if (strcmp(line, "0") == 0)
@@ -839,6 +860,20 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_ENCODER_CAL_END;
   }
 
+  if ((strncmp(line, "ES ", 3U) == 0) ||
+      (strcmp(line, "ES") == 0) ||
+      (strncmp(line, "ENCODER SCALE", 13U) == 0))
+  {
+    return BLUETOOTH_CMD_ENCODER_SCALE_SET;
+  }
+
+  if ((strcmp(line, "ENCODER DEBUG") == 0) ||
+      (strcmp(line, "EDEBUG") == 0) ||
+      (strcmp(line, "ED") == 0))
+  {
+    return BLUETOOTH_CMD_ENCODER_DEBUG;
+  }
+
   if ((strcmp(line, "96") == 0) ||
       (strcmp(line, "AUTO MAP") == 0) ||
       (strcmp(line, "AUTO MAP ON") == 0) ||
@@ -916,6 +951,12 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "MPU CALIBRATE") == 0))
   {
     return BLUETOOTH_CMD_GYRO_CALIBRATE;
+  }
+
+  if ((strncmp(line, "GYRO SCALE", 10U) == 0) ||
+      (strncmp(line, "GS ", 3U) == 0))
+  {
+    return BLUETOOTH_CMD_GYRO_SCALE_SET;
   }
 
   if ((strcmp(line, "MPU") == 0) ||
