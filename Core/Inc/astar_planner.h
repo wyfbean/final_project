@@ -43,6 +43,9 @@ AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapsh
                                              uint8_t goal_x,
                                              uint8_t goal_y,
                                              AstarPlannerPath_t *out_path);
+bool AstarPlanner_IsPathTraversable(const MappingGridSnapshot_t *snapshot,
+                                    const AstarPlannerPath_t *path,
+                                    uint16_t from_index);
 const char *AstarPlanner_StatusName(AstarPlannerStatus_t status);
 
 #endif /* ASTAR_PLANNER_H */

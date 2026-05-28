@@ -4,9 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAPPING_GRID_WIDTH_CELLS   40U
-#define MAPPING_GRID_HEIGHT_CELLS  40U
-#define MAPPING_GRID_CELL_SIZE_MM  175U
+#define MAPPING_GRID_WIDTH_CELLS   56U
+#define MAPPING_GRID_HEIGHT_CELLS  56U
+#define MAPPING_GRID_CELL_SIZE_MM  125U
 #define MAPPING_GRID_MAX_RANGE_MM  8000U
 
 typedef enum

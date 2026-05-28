@@ -3,10 +3,13 @@
 #include <string.h>
 
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
-#define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
-#define ASTAR_OBSTACLE_INFLATION_CELLS 0
-#define ASTAR_FREE_STEP_COST 1U
-#define ASTAR_HEURISTIC_WEIGHT 1U
+#define ASTAR_FRONTIER_CANDIDATE_LIMIT 96U
+#define ASTAR_OBSTACLE_INFLATION_CELLS 1
+#define ASTAR_CARDINAL_STEP_COST 10U
+#define ASTAR_DIAGONAL_STEP_COST 14U
+#define ASTAR_FRONTIER_GAIN_RADIUS_CELLS 2
+#define ASTAR_FRONTIER_GAIN_WEIGHT 24U
+#define ASTAR_FRONTIER_DISTANCE_WEIGHT 2U
 #define ASTAR_NODE_FLAG_OPEN 0x01U
 #define ASTAR_NODE_FLAG_CLOSED 0x02U
 #define ASTAR_COST_INF 0xFFFFU
@@ -15,6 +18,8 @@ typedef struct
 {
   uint16_t index;
   uint16_t distance;
+  uint16_t gain;
+  uint32_t score;
 } AstarFrontierCandidate_t;
 
 static uint16_t s_g_score[ASTAR_TOTAL_CELLS];
@@ -25,10 +30,13 @@ static AstarFrontierCandidate_t s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_L
 static uint16_t Astar_Index(uint8_t x, uint8_t y);
 static void Astar_Cell(uint16_t index, uint8_t *out_x, uint8_t *out_y);
 static uint16_t Astar_Manhattan(uint8_t ax, uint8_t ay, uint8_t bx, uint8_t by);
+static uint16_t Astar_Octile(uint8_t ax, uint8_t ay, uint8_t bx, uint8_t by);
 static bool Astar_IsInside(int16_t x, int16_t y);
 static bool Astar_IsFree(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
 static bool Astar_IsSearchPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
 static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
+static uint16_t Astar_FrontierUnknownGain(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
+static uint32_t Astar_FrontierScore(uint16_t distance, uint16_t gain);
 static bool Astar_IsFrontierCandidate(const MappingGridSnapshot_t *snapshot,
                                       uint8_t start_x,
                                       uint8_t start_y,
@@ -41,8 +49,14 @@ static AstarPlannerStatus_t Astar_PlanToFrontierInternal(const MappingGridSnapsh
 static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
                                                uint8_t start_y);
-static bool Astar_CandidateBetter(uint16_t distance, uint16_t other_distance);
-static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *count);
+static bool Astar_CandidateBetter(uint32_t score,
+                                  uint16_t distance,
+                                  uint32_t other_score,
+                                  uint16_t other_distance);
+static void Astar_InsertCandidate(uint16_t index,
+                                  uint16_t distance,
+                                  uint16_t gain,
+                                  uint8_t *count);
 static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
                                                uint8_t start_x,
                                                uint8_t start_y,
@@ -159,6 +173,33 @@ AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapsh
   return status;
 }
 
+bool AstarPlanner_IsPathTraversable(const MappingGridSnapshot_t *snapshot,
+                                    const AstarPlannerPath_t *path,
+                                    uint16_t from_index)
+{
+  uint16_t i;
+
+  if ((snapshot == NULL) || (path == NULL) || (path->length == 0U))
+  {
+    return false;
+  }
+
+  if (from_index >= path->length)
+  {
+    return false;
+  }
+
+  for (i = from_index; i < path->length; ++i)
+  {
+    if (!Astar_IsSearchPassable(snapshot, path->cells[i].x, path->cells[i].y))
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 const char *AstarPlanner_StatusName(AstarPlannerStatus_t status)
 {
   switch (status)
@@ -198,6 +239,17 @@ static uint16_t Astar_Manhattan(uint8_t ax, uint8_t ay, uint8_t bx, uint8_t by)
   return (uint16_t)(dx + dy);
 }
 
+static uint16_t Astar_Octile(uint8_t ax, uint8_t ay, uint8_t bx, uint8_t by)
+{
+  uint16_t dx = (ax >= bx) ? (uint16_t)(ax - bx) : (uint16_t)(bx - ax);
+  uint16_t dy = (ay >= by) ? (uint16_t)(ay - by) : (uint16_t)(by - ay);
+  uint16_t diagonal = (dx < dy) ? dx : dy;
+  uint16_t straight = (dx > dy) ? (uint16_t)(dx - dy) : (uint16_t)(dy - dx);
+
+  return (uint16_t)((diagonal * ASTAR_DIAGONAL_STEP_COST) +
+                    (straight * ASTAR_CARDINAL_STEP_COST));
+}
+
 static bool Astar_IsInside(int16_t x, int16_t y)
 {
   return ((x >= 0) &&
@@ -227,7 +279,7 @@ static bool Astar_IsSearchPassable(const MappingGridSnapshot_t *snapshot, uint8_
     return false;
   }
 
-  return snapshot->cells[y][x] == MAPPING_GRID_CELL_FREE;
+  return Astar_IsInflatedPassable(snapshot, x, y);
 }
 
 static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y)
@@ -264,6 +316,42 @@ static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint
 #endif
 
   return true;
+}
+
+static uint16_t Astar_FrontierUnknownGain(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y)
+{
+  int16_t dx;
+  int16_t dy;
+  uint16_t gain = 0U;
+
+  if (snapshot == NULL)
+  {
+    return 0U;
+  }
+
+  for (dy = -ASTAR_FRONTIER_GAIN_RADIUS_CELLS; dy <= ASTAR_FRONTIER_GAIN_RADIUS_CELLS; ++dy)
+  {
+    for (dx = -ASTAR_FRONTIER_GAIN_RADIUS_CELLS; dx <= ASTAR_FRONTIER_GAIN_RADIUS_CELLS; ++dx)
+    {
+      int16_t nx = (int16_t)x + dx;
+      int16_t ny = (int16_t)y + dy;
+
+      if (Astar_IsInside(nx, ny) &&
+          (snapshot->cells[ny][nx] == MAPPING_GRID_CELL_UNKNOWN))
+      {
+        gain++;
+      }
+    }
+  }
+
+  return gain;
+}
+
+static uint32_t Astar_FrontierScore(uint16_t distance, uint16_t gain)
+{
+  uint32_t gain_score = (uint32_t)gain * ASTAR_FRONTIER_GAIN_WEIGHT;
+  uint32_t dist_penalty = (uint32_t)distance * ASTAR_FRONTIER_DISTANCE_WEIGHT;
+  return (gain_score > dist_penalty) ? (gain_score - dist_penalty) : 0U;
 }
 
 static bool Astar_IsFrontierCandidate(const MappingGridSnapshot_t *snapshot,
@@ -315,9 +403,13 @@ static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snap
     {
       if (Astar_IsFrontierCandidate(snapshot, start_x, start_y, x, y))
       {
+        uint16_t distance = Astar_Manhattan(start_x, start_y, x, y);
+        uint16_t gain = Astar_FrontierUnknownGain(snapshot, x, y);
+
         Astar_InsertCandidate(
             Astar_Index(x, y),
-            Astar_Manhattan(start_x, start_y, x, y),
+            distance,
+            gain,
             &count);
       }
     }
@@ -326,14 +418,22 @@ static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snap
   return count;
 }
 
-static bool Astar_CandidateBetter(uint16_t distance, uint16_t other_distance)
+static bool Astar_CandidateBetter(uint32_t score,
+                                  uint16_t distance,
+                                  uint32_t other_score,
+                                  uint16_t other_distance)
 {
-  return distance < other_distance;
+  return (score > other_score) ||
+      ((score == other_score) && (distance < other_distance));
 }
 
-static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *count)
+static void Astar_InsertCandidate(uint16_t index,
+                                  uint16_t distance,
+                                  uint16_t gain,
+                                  uint8_t *count)
 {
   uint8_t pos;
+  uint32_t score = Astar_FrontierScore(distance, gain);
 
   if (count == NULL)
   {
@@ -344,7 +444,9 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *co
   if (pos >= ASTAR_FRONTIER_CANDIDATE_LIMIT)
   {
     if (!Astar_CandidateBetter(
+            score,
             distance,
+            s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_LIMIT - 1U].score,
             s_frontier_candidates[ASTAR_FRONTIER_CANDIDATE_LIMIT - 1U].distance))
     {
       return;
@@ -358,7 +460,9 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *co
 
   while ((pos > 0U) &&
          Astar_CandidateBetter(
+             score,
              distance,
+             s_frontier_candidates[pos - 1U].score,
              s_frontier_candidates[pos - 1U].distance))
   {
     s_frontier_candidates[pos] = s_frontier_candidates[pos - 1U];
@@ -367,6 +471,8 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *co
 
   s_frontier_candidates[pos].index = index;
   s_frontier_candidates[pos].distance = distance;
+  s_frontier_candidates[pos].gain = gain;
+  s_frontier_candidates[pos].score = score;
 }
 
 static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
@@ -376,11 +482,15 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
                                                uint8_t goal_y,
                                                AstarPlannerPath_t *out_path)
 {
-  static const int8_t offsets[4][2] = {
+  static const int8_t offsets[8][2] = {
       {1, 0},
       {-1, 0},
       {0, 1},
       {0, -1},
+      {1, 1},
+      {1, -1},
+      {-1, 1},
+      {-1, -1},
   };
   uint16_t start_index = Astar_Index(start_x, start_y);
   uint16_t goal_index = Astar_Index(goal_x, goal_y);
@@ -417,12 +527,13 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
     expanded++;
     Astar_Cell(current, &current_x, &current_y);
 
-    for (i = 0U; i < 4U; ++i)
+    for (i = 0U; i < 8U; ++i)
     {
       int16_t nx = (int16_t)current_x + offsets[i][0];
       int16_t ny = (int16_t)current_y + offsets[i][1];
       uint16_t neighbor;
       uint16_t tentative_g;
+      uint16_t step_cost;
 
       if (!Astar_IsInside(nx, ny))
       {
@@ -440,7 +551,22 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
         continue;
       }
 
-      tentative_g = (uint16_t)(s_g_score[current] + ASTAR_FREE_STEP_COST);
+      if ((offsets[i][0] != 0) && (offsets[i][1] != 0))
+      {
+        int16_t sx = (int16_t)current_x + offsets[i][0];
+        int16_t sy = (int16_t)current_y + offsets[i][1];
+
+        if (!Astar_IsSearchPassable(snapshot, (uint8_t)sx, current_y) ||
+            !Astar_IsSearchPassable(snapshot, current_x, (uint8_t)sy))
+        {
+          continue;
+        }
+      }
+
+      step_cost = ((offsets[i][0] != 0) && (offsets[i][1] != 0)) ?
+          ASTAR_DIAGONAL_STEP_COST :
+          ASTAR_CARDINAL_STEP_COST;
+      tentative_g = (uint16_t)(s_g_score[current] + step_cost);
       if (((s_node_flags[neighbor] & ASTAR_NODE_FLAG_OPEN) == 0U) ||
           (tentative_g < s_g_score[neighbor]))
       {
@@ -526,8 +652,8 @@ static uint16_t Astar_PickBestOpen(uint8_t goal_x, uint8_t goal_y)
       uint16_t f;
 
       Astar_Cell(i, &x, &y);
-      h = Astar_Manhattan(x, y, goal_x, goal_y);
-      weighted_h = (uint16_t)(h * ASTAR_HEURISTIC_WEIGHT);
+      h = Astar_Octile(x, y, goal_x, goal_y);
+      weighted_h = h;
       f = (uint16_t)(s_g_score[i] + weighted_h);
       if ((best_index == ASTAR_COST_INF) ||
           (f < best_f) ||

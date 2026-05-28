@@ -24,8 +24,6 @@
 #define SLAM_NAV_MAX_TURN_PWM           390U
 #define SLAM_NAV_MIN_SAFE_MM            50U
 #define SLAM_NAV_MAX_SAFE_MM            2000U
-#define SLAM_NAV_MAX_LOCAL_BLOCK_MM     650U
-#define SLAM_NAV_LOCAL_CLEARANCE_MM     150U
 #define SLAM_NAV_MIN_DRIVE_PWM          300U
 #define SLAM_NAV_MIN_TURN_PWM           300U
 #define SLAM_NAV_FRONT_SECTOR_CDEG      1500U
@@ -38,8 +36,6 @@
 #define SLAM_NAV_FRONT_LEFT_CENTER_CDEG 4500U
 #define SLAM_NAV_FRONT_BODY_OFFSET_MM  200U
 #define SLAM_NAV_FRONT_DIAGONAL_BODY_OFFSET_MM 140U
-#define SLAM_NAV_FRONT_BLOCK_HOLD_MS    600U
-#define SLAM_NAV_FRONT_BLOCK_CONFIRM_MS 450U
 #define SLAM_NAV_TURN_TOL_CDEG          1200L
 #define SLAM_NAV_TURN_SETTLE_MS         280U
 #define SLAM_NAV_DRIVE_HEADING_TOL_CDEG 2600L
@@ -54,10 +50,10 @@
 #define SLAM_NAV_PATH_CHUNK_CELLS       10U
 #define SLAM_NAV_TURN_TIMEOUT_MS        6000U
 #define SLAM_NAV_SECTOR_STALE_MS        1000U
-#define SLAM_NAV_FORWARD_REPLAN_SECTOR_CDEG 4500L
+#define SLAM_NAV_PATH_VALIDATE_INTERVAL_MS 150U
 #define SLAM_NAV_CENTER_GOAL_X_MM       0L
 #define SLAM_NAV_CENTER_GOAL_Y_MM       0L
-#define SLAM_NAV_MOTION_STEP_MM         350U
+#define SLAM_NAV_MOTION_STEP_MM         700U
 #define SLAM_NAV_MOTION_STEP_CELLS      ((uint16_t)((SLAM_NAV_MOTION_STEP_MM + (MAPPING_GRID_CELL_SIZE_MM / 2U)) / MAPPING_GRID_CELL_SIZE_MM))
 
 typedef enum
@@ -109,10 +105,10 @@ static SlamNavState_t s_state = SLAM_NAV_STATE_IDLE;
 static uint16_t s_drive_pwm_permille = SLAM_NAV_DEFAULT_DRIVE_PWM;
 static uint16_t s_turn_pwm_permille = SLAM_NAV_DEFAULT_TURN_PWM;
 static uint16_t s_safe_distance_mm = SLAM_NAV_DEFAULT_SAFE_MM;
-static uint32_t s_front_blocked_until_ms;
-static uint32_t s_front_blocked_since_ms;
 static uint16_t s_front_min_distance_mm;
 static uint16_t s_path_index;
+static uint32_t s_path_revision;
+static uint32_t s_last_path_validate_tick_ms;
 static AstarPlannerCell_t s_current_target_cell;
 static int32_t s_target_x_mm;
 static int32_t s_target_y_mm;
@@ -142,21 +138,18 @@ static void SlamNav_UpdateDrive(void);
 static bool SlamNav_GetPoseAndCell(MappingGridPose_t *out_pose, uint8_t *out_x, uint8_t *out_y);
 static bool SlamNav_SetTargetFromPath(uint16_t path_index);
 static uint16_t SlamNav_SelectNextPathIndex(uint16_t from_path_index);
-static bool SlamNav_IsFrontBlocked(void);
+static bool SlamNav_PathStillTraversable(uint32_t now);
 static bool SlamNav_IsFrontAngle(uint16_t angle_cdeg);
 static bool SlamNav_IsAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, uint16_t half_width_cdeg);
 static int32_t SlamNav_NormalizeHeadingCdeg(int32_t heading_cdeg);
 static int32_t SlamNav_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t SlamNav_Abs32(int32_t value);
 static uint16_t SlamNav_ClampPwm(uint16_t value);
-static uint16_t SlamNav_LocalBlockDistanceMm(uint16_t configured_safe_mm);
 static void SlamNav_ResetSectorStats(SlamNavSectorStats_t *stats);
 static void SlamNav_UpdateSectorMin(uint16_t *value, uint16_t distance_mm);
 static void SlamNav_UpdateSectorStats(uint16_t robot_angle_cdeg, uint16_t distance_mm);
 static SlamNavSectorStats_t SlamNav_GetSectorSnapshot(uint32_t now);
 static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16_t distance_mm);
-static bool SlamNav_ApplyFrontBlockToSnapshot(const MappingGridPose_t *pose, uint8_t start_x, uint8_t start_y);
-static bool SlamNav_PathFirstStepIsForward(const MappingGridPose_t *pose);
 static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm);
 static uint16_t SlamNav_ClampConfiguredPwm(uint16_t value, uint16_t maximum);
 static int32_t SlamNav_HeadingHoldSteer(int32_t error_cdeg);
@@ -282,9 +275,6 @@ void SlamNav_SetControlConfig(uint16_t drive_pwm_permille,
 
 void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
 {
-  uint32_t now;
-  uint16_t safe_mm;
-  uint16_t local_block_mm;
   uint16_t robot_angle_cdeg;
   uint16_t clearance_mm;
 
@@ -305,6 +295,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
       s_sector_last = s_sector_current;
     }
     SlamNav_ResetSectorStats(&s_sector_current);
+    s_front_min_distance_mm = 0U;
     taskEXIT_CRITICAL();
   }
 
@@ -322,26 +313,11 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   }
 
   taskENTER_CRITICAL();
-  safe_mm = s_safe_distance_mm;
-  taskEXIT_CRITICAL();
-
-  local_block_mm = SlamNav_LocalBlockDistanceMm(safe_mm);
-  if (clearance_mm <= local_block_mm)
+  if ((s_front_min_distance_mm == 0U) || (clearance_mm < s_front_min_distance_mm))
   {
-    now = HAL_GetTick();
-    taskENTER_CRITICAL();
-    if (s_front_blocked_since_ms == 0U)
-    {
-      s_front_blocked_since_ms = now;
-    }
-    if (clearance_mm <= safe_mm)
-    {
-      s_front_blocked_since_ms = now - SLAM_NAV_FRONT_BLOCK_CONFIRM_MS;
-    }
-    s_front_blocked_until_ms = now + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
     s_front_min_distance_mm = clearance_mm;
-    taskEXIT_CRITICAL();
   }
+  taskEXIT_CRITICAL();
 }
 
 const char *SlamNav_StateName(SlamNavState_t state)
@@ -435,10 +411,10 @@ static void SlamNav_StartInternal(SlamNavMode_t mode, int32_t goal_x_mm, int32_t
   s_mode = mode;
   s_state = SLAM_NAV_STATE_PLAN;
   s_state_enter_tick_ms = HAL_GetTick();
-  s_front_blocked_until_ms = 0U;
-  s_front_blocked_since_ms = 0U;
   s_front_min_distance_mm = 0U;
   s_path_index = 0U;
+  s_path_revision = 0U;
+  s_last_path_validate_tick_ms = 0U;
   s_plan_seq = 0U;
   s_turn_settle_until_ms = 0U;
   s_last_heartbeat_tick_ms = 0U;
@@ -466,9 +442,10 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
   s_mode = SLAM_NAV_MODE_EXPLORE;
   s_state = SLAM_NAV_STATE_IDLE;
   s_state_enter_tick_ms = HAL_GetTick();
-  s_front_blocked_until_ms = 0U;
-  s_front_blocked_since_ms = 0U;
   s_front_min_distance_mm = 0U;
+  s_path_index = 0U;
+  s_path_revision = 0U;
+  s_last_path_validate_tick_ms = 0U;
   s_last_path_tx_valid = false;
   s_turn_settle_until_ms = 0U;
   SlamNav_ResetSectorStats(&s_sector_current);
@@ -489,7 +466,6 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
 static void SlamNav_UpdatePlan(void)
 {
   MappingGridPose_t pose;
-  uint32_t now = HAL_GetTick();
   uint8_t start_x;
   uint8_t start_y;
   uint8_t goal_x = 0U;
@@ -499,7 +475,6 @@ static void SlamNav_UpdatePlan(void)
   int32_t return_goal_x_mm;
   int32_t return_goal_y_mm;
   const char *plan_state = "FRONTIER";
-  bool front_blocked;
 
   if (!SlamNav_GetPoseAndCell(&pose, &start_x, &start_y))
   {
@@ -520,12 +495,6 @@ static void SlamNav_UpdatePlan(void)
     MotorControl_Stop();
     SlamNav_SendStatus("NO_PATH", "SNAPSHOT");
     return;
-  }
-
-  front_blocked = SlamNav_IsFrontBlocked();
-  if (front_blocked)
-  {
-    (void)SlamNav_ApplyFrontBlockToSnapshot(&pose, start_x, start_y);
   }
 
   taskENTER_CRITICAL();
@@ -611,18 +580,6 @@ static void SlamNav_UpdatePlan(void)
     return;
   }
 
-  if ((mode == SLAM_NAV_MODE_EXPLORE) &&
-      front_blocked &&
-      SlamNav_PathFirstStepIsForward(&pose))
-  {
-    MotorControl_Stop();
-    s_state = SLAM_NAV_STATE_NO_PATH;
-    s_state_enter_tick_ms = now;
-    s_active = false;
-    SlamNav_SendStatus("NO_PATH", "FRONT_BLOCKED");
-    return;
-  }
-
   if (!SlamNav_SetTargetFromPath(SlamNav_SelectNextPathIndex(0U)))
   {
     s_state = SLAM_NAV_STATE_NO_PATH;
@@ -636,9 +593,8 @@ static void SlamNav_UpdatePlan(void)
   s_state = SLAM_NAV_STATE_TURN;
   s_state_enter_tick_ms = HAL_GetTick();
   s_turn_settle_until_ms = 0U;
-  taskENTER_CRITICAL();
-  s_front_blocked_until_ms = 0U;
-  taskEXIT_CRITICAL();
+  s_path_revision = s_snapshot.revision;
+  s_last_path_validate_tick_ms = HAL_GetTick();
   SlamNav_SendPath();
   SlamNav_SendStatus(plan_state, AstarPlanner_StatusName(status));
 }
@@ -703,6 +659,7 @@ static void SlamNav_UpdateTurn(void)
 static void SlamNav_UpdateDrive(void)
 {
   MappingGridPose_t pose;
+  uint32_t now = HAL_GetTick();
   uint8_t current_x;
   uint8_t current_y;
   int32_t dx_mm;
@@ -719,23 +676,21 @@ static void SlamNav_UpdateDrive(void)
     return;
   }
 
-  if (SlamNav_IsFrontBlocked())
-  {
-    uint32_t now = HAL_GetTick();
-
-    MotorControl_Stop();
-    s_state = SLAM_NAV_STATE_REPLAN;
-    s_state_enter_tick_ms = now;
-    SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
-    return;
-  }
-
   if (MappingGrid_GetCell(s_current_target_cell.x, s_current_target_cell.y) == MAPPING_GRID_CELL_OCCUPIED)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_REPLAN;
-    s_state_enter_tick_ms = HAL_GetTick();
+    s_state_enter_tick_ms = now;
     SlamNav_SendStatus("REPLAN", "TARGET_BLOCKED");
+    return;
+  }
+
+  if (!SlamNav_PathStillTraversable(now))
+  {
+    MotorControl_Stop();
+    s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = now;
+    SlamNav_SendStatus("REPLAN", "PATH_BLOCKED");
     return;
   }
 
@@ -746,7 +701,7 @@ static void SlamNav_UpdateDrive(void)
       (distance_sq <= (SLAM_NAV_TARGET_RADIUS_MM * SLAM_NAV_TARGET_RADIUS_MM)))
   {
     MotorControl_Stop();
-    s_state_enter_tick_ms = HAL_GetTick();
+    s_state_enter_tick_ms = now;
     if ((s_path_index + 1U) < s_path.length)
     {
       if (SlamNav_SetTargetFromPath(SlamNav_SelectNextPathIndex(s_path_index)))
@@ -769,7 +724,7 @@ static void SlamNav_UpdateDrive(void)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_TURN;
-    s_state_enter_tick_ms = HAL_GetTick();
+    s_state_enter_tick_ms = now;
     s_turn_settle_until_ms = 0U;
     return;
   }
@@ -848,29 +803,33 @@ static uint16_t SlamNav_SelectNextPathIndex(uint16_t from_path_index)
   return target_index;
 }
 
-static bool SlamNav_IsFrontBlocked(void)
+static bool SlamNav_PathStillTraversable(uint32_t now)
 {
-  bool blocked;
-  uint32_t now = HAL_GetTick();
+  uint32_t revision = MappingGrid_GetRevision();
 
-  taskENTER_CRITICAL();
-  if ((s_front_blocked_until_ms != 0U) &&
-      ((int32_t)(now - s_front_blocked_until_ms) >= 0L))
+  if (revision == s_path_revision)
   {
-    s_front_blocked_until_ms = 0U;
-    s_front_blocked_since_ms = 0U;
-    s_front_min_distance_mm = 0U;
-    blocked = false;
+    return true;
   }
-  else
+
+  if ((now - s_last_path_validate_tick_ms) < SLAM_NAV_PATH_VALIDATE_INTERVAL_MS)
   {
-    blocked =
-        (s_front_blocked_since_ms != 0U) &&
-        (s_front_blocked_until_ms != 0U) &&
-        ((int32_t)(now - s_front_blocked_since_ms) >= (int32_t)SLAM_NAV_FRONT_BLOCK_CONFIRM_MS);
+    return true;
   }
-  taskEXIT_CRITICAL();
-  return blocked;
+  s_last_path_validate_tick_ms = now;
+
+  if (!MappingGrid_CopySnapshot(&s_snapshot))
+  {
+    return false;
+  }
+
+  if (!AstarPlanner_IsPathTraversable(&s_snapshot, &s_path, s_path_index))
+  {
+    return false;
+  }
+
+  s_path_revision = s_snapshot.revision;
+  return true;
 }
 
 static bool SlamNav_IsFrontAngle(uint16_t angle_cdeg)
@@ -925,20 +884,6 @@ static int32_t SlamNav_Abs32(int32_t value)
 static uint16_t SlamNav_ClampPwm(uint16_t value)
 {
   return (value > SLAM_NAV_MAX_PWM) ? SLAM_NAV_MAX_PWM : value;
-}
-
-static uint16_t SlamNav_LocalBlockDistanceMm(uint16_t configured_safe_mm)
-{
-  uint16_t local_min_mm = (uint16_t)(MAPPING_GRID_CELL_SIZE_MM + SLAM_NAV_LOCAL_CLEARANCE_MM);
-  uint16_t block_mm;
-
-  if (configured_safe_mm < SLAM_NAV_MIN_SAFE_MM)
-  {
-    configured_safe_mm = SLAM_NAV_MIN_SAFE_MM;
-  }
-
-  block_mm = (configured_safe_mm < local_min_mm) ? local_min_mm : configured_safe_mm;
-  return (block_mm > SLAM_NAV_MAX_LOCAL_BLOCK_MM) ? SLAM_NAV_MAX_LOCAL_BLOCK_MM : block_mm;
 }
 
 static void SlamNav_ResetSectorStats(SlamNavSectorStats_t *stats)
@@ -1049,72 +994,6 @@ static uint16_t SlamNav_ApplyForwardBodyOffset(uint16_t robot_angle_cdeg, uint16
   return (distance_mm > offset_mm) ? (uint16_t)(distance_mm - offset_mm) : 0U;
 }
 
-static bool SlamNav_ApplyFrontBlockToSnapshot(const MappingGridPose_t *pose, uint8_t start_x, uint8_t start_y)
-{
-  static const int8_t offsets[4][2] = {
-      {1, 0},
-      {-1, 0},
-      {0, -1},
-      {0, 1},
-  };
-  AstarPlannerCell_t from;
-  uint8_t i;
-  bool applied = false;
-
-  if ((pose == NULL) ||
-      (start_x >= MAPPING_GRID_WIDTH_CELLS) ||
-      (start_y >= MAPPING_GRID_HEIGHT_CELLS))
-  {
-    return false;
-  }
-
-  from.x = start_x;
-  from.y = start_y;
-  for (i = 0U; i < 4U; ++i)
-  {
-    int16_t nx = (int16_t)start_x + offsets[i][0];
-    int16_t ny = (int16_t)start_y + offsets[i][1];
-    AstarPlannerCell_t to;
-    int32_t cell_heading_cdeg;
-    int32_t heading_error_cdeg;
-
-    if ((nx < 0) ||
-        (ny < 0) ||
-        (nx >= (int16_t)MAPPING_GRID_WIDTH_CELLS) ||
-        (ny >= (int16_t)MAPPING_GRID_HEIGHT_CELLS))
-    {
-      continue;
-    }
-
-    to.x = (uint8_t)nx;
-    to.y = (uint8_t)ny;
-    cell_heading_cdeg = SlamNav_CellHeadingCdeg(&from, &to);
-    heading_error_cdeg = SlamNav_SignedHeadingErrorCdeg(cell_heading_cdeg, pose->heading_cdeg);
-    if (SlamNav_Abs32(heading_error_cdeg) <= SLAM_NAV_FORWARD_REPLAN_SECTOR_CDEG)
-    {
-      s_snapshot.cells[to.y][to.x] = MAPPING_GRID_CELL_OCCUPIED;
-      applied = true;
-    }
-  }
-
-  return applied;
-}
-
-static bool SlamNav_PathFirstStepIsForward(const MappingGridPose_t *pose)
-{
-  int32_t first_heading_cdeg;
-  int32_t error_cdeg;
-
-  if ((pose == NULL) || (s_path.length < 2U))
-  {
-    return false;
-  }
-
-  first_heading_cdeg = SlamNav_CellHeadingCdeg(&s_path.cells[0], &s_path.cells[1]);
-  error_cdeg = SlamNav_SignedHeadingErrorCdeg(first_heading_cdeg, pose->heading_cdeg);
-  return SlamNav_Abs32(error_cdeg) <= 4500L;
-}
-
 static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm)
 {
   uint16_t pwm = (configured_pwm > 0U) ? configured_pwm : fallback_pwm;
@@ -1158,22 +1037,48 @@ static int32_t SlamNav_HeadingHoldSteer(int32_t error_cdeg)
 
 static int32_t SlamNav_CellHeadingCdeg(const AstarPlannerCell_t *from, const AstarPlannerCell_t *to)
 {
+  int16_t dx;
+  int16_t dy;
+
   if ((from == NULL) || (to == NULL))
   {
     return 0L;
   }
 
-  if (to->x > from->x)
+  dx = (int16_t)to->x - (int16_t)from->x;
+  dy = (int16_t)to->y - (int16_t)from->y;
+
+  if ((dx > 0) && (dy < 0))
+  {
+    return 4500L;
+  }
+
+  if ((dx < 0) && (dy < 0))
+  {
+    return 13500L;
+  }
+
+  if ((dx < 0) && (dy > 0))
+  {
+    return 22500L;
+  }
+
+  if ((dx > 0) && (dy > 0))
+  {
+    return 31500L;
+  }
+
+  if (dx > 0)
   {
     return 0L;
   }
 
-  if (to->x < from->x)
+  if (dx < 0)
   {
     return 18000L;
   }
 
-  if (to->y < from->y)
+  if (dy < 0)
   {
     return 9000L;
   }
@@ -1230,7 +1135,6 @@ static void SlamNav_SendHeartbeatIfDue(void)
   uint32_t now = HAL_GetTick();
   uint32_t revision = MappingGrid_GetRevision();
   uint16_t configured_safe_mm;
-  uint16_t local_block_mm;
   uint16_t front_sector_mm;
   SlamNavSectorStats_t sectors;
   MappingGridPose_t pose;
@@ -1247,7 +1151,6 @@ static void SlamNav_SendHeartbeatIfDue(void)
   taskENTER_CRITICAL();
   configured_safe_mm = s_safe_distance_mm;
   taskEXIT_CRITICAL();
-  local_block_mm = SlamNav_LocalBlockDistanceMm(configured_safe_mm);
   sectors = SlamNav_GetSectorSnapshot(now);
   front_sector_mm = (sectors.front_mm == UINT16_MAX) ? 0U : sectors.front_mm;
 
@@ -1255,7 +1158,7 @@ static void SlamNav_SendHeartbeatIfDue(void)
   (void)snprintf(
       line,
       sizeof(line),
-      "SLAM HB state=%s seq=%lu cell=%u,%u target=%u,%u path_i=%u path_len=%u front=%u rev=%lu safe=%u adc_safe=%u block_front=%u sec=%u,%u,%u,%u pose=%ld,%ld,%ld ok=%u\r\n",
+      "SLAM HB state=%s seq=%lu cell=%u,%u target=%u,%u path_i=%u path_len=%u front=%u rev=%lu path_rev=%lu safe=%u sec=%u,%u,%u,%u pose=%ld,%ld,%ld ok=%u\r\n",
       SlamNav_StateName(s_state),
       (unsigned long)s_plan_seq,
       (unsigned int)cell_x,
@@ -1266,9 +1169,8 @@ static void SlamNav_SendHeartbeatIfDue(void)
       (unsigned int)s_path.length,
       (unsigned int)front_sector_mm,
       (unsigned long)revision,
-      (unsigned int)local_block_mm,
+      (unsigned long)s_path_revision,
       (unsigned int)configured_safe_mm,
-      (unsigned int)s_front_min_distance_mm,
       (unsigned int)sectors.front_mm,
       (unsigned int)sectors.right_mm,
       (unsigned int)sectors.left_mm,

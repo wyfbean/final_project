@@ -415,6 +415,7 @@ static void MotorControl_UpdateStraightCorrection(void)
   if (total_travel < MOTOR_STRAIGHT_MIN_COUNTS)
   {
     s_motor_state.balance_error = error;
+    s_straight_prev_error = 0L;
     return;
   }
 
