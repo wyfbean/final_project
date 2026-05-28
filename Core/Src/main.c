@@ -134,7 +134,7 @@
 #define MAPPING_POSE_HISTORY_LENGTH 64U
 #define MAPPING_LIDAR_POINT_MAX_AGE_MS 250U
 #define ENCODER_RIGHT_DELTA_SIGN    (-1L)
-#define MAPPING_ENCODER_MM_PER_COUNT_X1000 94L
+#define MAPPING_ENCODER_MM_PER_COUNT_X1000 160L
 #define ENCODER_CAL_DISTANCE_MM     350L
 #define ENCODER_CAL_MIN_COUNTS      10L
 #define GYRO_STATIONARY_COUNT_THRESHOLD 2L
@@ -3144,14 +3144,18 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     return;
   }
 
-  /* Execute turn with axis-snapped target heading */
+  /* Execute turn: target = current ± step, NO pre-snap.
+     Pre-snapping the current heading before adding the step can produce
+     135° or 45° actual turns when the car is at a diagonal (e.g. 45°):
+       snap(45°)=90°, left 90° → target 180°, error = 135°.
+     Computing directly from current heading always gives exactly turn_degrees. */
   {
-    int32_t snapped_error_cdeg;
+    int32_t step_cdeg = (turn_degrees >= 135U) ? 18000L : 9000L;
     uint16_t snapped_degrees;
 
-    target_heading_cdeg = TestApp_GetAutoTurnTargetHeading(turn_direction, turn_degrees);
-    snapped_error_cdeg = TestApp_SignedHeadingErrorCdeg(target_heading_cdeg, mapping_pose.heading_cdeg);
-    snapped_degrees = (uint16_t)((AppAbs32(snapped_error_cdeg) + 50L) / 100L);
+    target_heading_cdeg = NormalizeHeadingCdeg(
+        mapping_pose.heading_cdeg + ((turn_direction < 0) ? step_cdeg : -step_cdeg));
+    snapped_degrees = turn_degrees;
     if (snapped_degrees < AUTO_MAPPING_MIN_TURN_DEG)
     {
       snapped_degrees = AUTO_MAPPING_MIN_TURN_DEG;
