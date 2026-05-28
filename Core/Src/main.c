@@ -119,12 +119,12 @@
 #define ANGLE_TURN_MAX_DEG          360U
 #define ANGLE_TURN_DONE_TOL_CDEG    250L
 #define ANGLE_TURN_CORRECTION_TOL_CDEG 300L
-#define ANGLE_TURN_MAX_CORRECTIONS  2U
+#define ANGLE_TURN_MAX_CORRECTIONS  3U
 #define ANGLE_TURN_TIMEOUT_MS       12000U
-#define ANGLE_TURN_SLOW_ZONE_CDEG   3000L
-#define ANGLE_TURN_FINE_ZONE_CDEG   1200L
-#define ANGLE_TURN_SLOW_PWM         450U
-#define ANGLE_TURN_FINE_PWM         320U
+#define ANGLE_TURN_SLOW_ZONE_CDEG   4500L
+#define ANGLE_TURN_FINE_ZONE_CDEG   2500L
+#define ANGLE_TURN_SLOW_PWM         380U
+#define ANGLE_TURN_FINE_PWM         280U
 #define ANGLE_TURN_INTEGRAL_GAIN_NUM 6LL
 #define ANGLE_TURN_INTEGRAL_GAIN_DEN 5LL
 #define MAPPING_START_X_MM          (-1500L)
@@ -1376,7 +1376,7 @@ static void TestApp_HandleBluetoothCommands(void)
         MotorControl_Stop();
         TestApp_ResumeMapping();
         SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
-        SlamNav_StartReturnTo(MAPPING_START_X_MM, MAPPING_START_Y_MM);
+        SlamNav_StartReturnTo(0L, 0L);
         break;
 
       case BLUETOOTH_CMD_GYRO_CALIBRATE:
@@ -2690,6 +2690,22 @@ static void TestApp_UpdateMode86(uint32_t now_ms)
         return;
       }
 
+      /* If residual heading error is within ±22.5°, snap pose to the intended
+         axis target. This corrects small gyro overshoot so the subsequent
+         heading-hold drive phase tracks a clean 0°/90°/180°/270° axis. */
+      {
+        int32_t residual = AppAbs32(TestApp_SignedHeadingErrorCdeg(
+            mode86_target_heading_cdeg, mapping_pose.heading_cdeg));
+        if (residual <= 2250L)
+        {
+          mapping_pose.heading_cdeg = NormalizeHeadingCdeg(mode86_target_heading_cdeg);
+          if (mapping_active)
+          {
+            MappingGrid_SetPose(&mapping_pose);
+          }
+        }
+      }
+
       mode86_state_until_ms = 0U;
       TestApp_Mode86StartDrive("AFTER_TURN", now_ms);
     }
@@ -3024,34 +3040,46 @@ static void TestApp_Mode86DecideAndAct(uint32_t now_ms)
     return;
   }
 
-  turn_step_cdeg = (turn_degrees >= 135U) ? 18000L : 9000L;
-  if (turn_direction < 0)
+  /* Use axis-snapped target: snap current heading to nearest 90° axis first,
+     then add the turn step. This mirrors auto-mapping logic and prevents
+     diagonal drift from accumulating across multiple turns. */
   {
-    target_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg + turn_step_cdeg);
-  }
-  else
-  {
-    target_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg - turn_step_cdeg);
-  }
-  mode86_target_heading_cdeg = target_heading_cdeg;
-  mode86_state = MODE86_STATE_TURN;
-  mode86_state_until_ms = 0U;
-  mode86_turn_completed = false;
-  mode86_turn_count++;
+    int32_t snapped_error_cdeg;
+    uint16_t snapped_degrees;
 
-  (void)snprintf(
-      line,
-      sizeof(line),
-      "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld turns=%lu%s\r\n",
-      dir,
-      reason,
-      (unsigned int)safe_mm,
-      (long)target_heading_cdeg,
-      (unsigned long)mode86_turn_count,
-      enc);
-  (void)BluetoothControl_SendText(line);
+    target_heading_cdeg = TestApp_GetAutoTurnTargetHeading(turn_direction, turn_degrees);
+    snapped_error_cdeg = TestApp_SignedHeadingErrorCdeg(target_heading_cdeg, mapping_pose.heading_cdeg);
+    snapped_degrees = (uint16_t)((AppAbs32(snapped_error_cdeg) + 50L) / 100L);
+    if (snapped_degrees < AUTO_MAPPING_MIN_TURN_DEG)
+    {
+      snapped_degrees = AUTO_MAPPING_MIN_TURN_DEG;
+    }
+    else if (snapped_degrees > AUTO_MAPPING_MAX_TURN_DEG)
+    {
+      snapped_degrees = AUTO_MAPPING_MAX_TURN_DEG;
+    }
 
-  TestApp_StartHeadingTurnFixed(turn_direction, turn_degrees, target_heading_cdeg, 0U, reason);
+    mode86_target_heading_cdeg = target_heading_cdeg;
+    mode86_state = MODE86_STATE_TURN;
+    mode86_state_until_ms = 0U;
+    mode86_turn_completed = false;
+    mode86_turn_count++;
+
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "MODE86 DECIDE dir=%c reason=%s safe=%u target=%ld snap_deg=%u turns=%lu%s\r\n",
+        dir,
+        reason,
+        (unsigned int)safe_mm,
+        (long)target_heading_cdeg,
+        (unsigned int)snapped_degrees,
+        (unsigned long)mode86_turn_count,
+        enc);
+    (void)BluetoothControl_SendText(line);
+
+    TestApp_StartHeadingTurnFixed(turn_direction, snapped_degrees, target_heading_cdeg, 0U, reason);
+  }
 }
 
 static void TestApp_ResetMode86SectorStats(void)

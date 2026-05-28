@@ -191,7 +191,7 @@ bool AstarPlanner_IsPathTraversable(const MappingGridSnapshot_t *snapshot,
 
   for (i = from_index; i < path->length; ++i)
   {
-    if (!Astar_IsSearchPassable(snapshot, path->cells[i].x, path->cells[i].y))
+    if (snapshot->cells[path->cells[i].y][path->cells[i].x] == MAPPING_GRID_CELL_OCCUPIED)
     {
       return false;
     }

@@ -43,7 +43,7 @@
 #define SLAM_NAV_HEADING_HOLD_CDEG_PER_PWM  40L
 #define SLAM_NAV_HEADING_HOLD_MAX_STEER     70L
 #define SLAM_NAV_TARGET_RADIUS_MM       120L
-#define SLAM_NAV_ROBOT_FREE_RADIUS      2U
+#define SLAM_NAV_ROBOT_FREE_RADIUS      1U
 #define SLAM_NAV_HEARTBEAT_INTERVAL_MS  500U
 #define SLAM_NAV_STATUS_INTERVAL_MS     300U
 #define SLAM_NAV_PATH_TX_INTERVAL_MS    1000U
@@ -126,6 +126,7 @@ static int32_t s_return_goal_x_mm;
 static int32_t s_return_goal_y_mm;
 static SlamNavSectorStats_t s_sector_current;
 static SlamNavSectorStats_t s_sector_last;
+static bool s_escape_replan_after_turn;
 
 static void SlamNav_Task(void *argument);
 static void SlamNav_HandleCommand(const SlamNavCommandMessage_t *message);
@@ -424,6 +425,7 @@ static void SlamNav_StartInternal(SlamNavMode_t mode, int32_t goal_x_mm, int32_t
   s_last_path_tx_length = 0U;
   s_return_goal_x_mm = (mode == SLAM_NAV_MODE_EXPLORE) ? SLAM_NAV_CENTER_GOAL_X_MM : goal_x_mm;
   s_return_goal_y_mm = (mode == SLAM_NAV_MODE_EXPLORE) ? SLAM_NAV_CENTER_GOAL_Y_MM : goal_y_mm;
+  s_escape_replan_after_turn = false;
   SlamNav_ResetSectorStats(&s_sector_current);
   SlamNav_ResetSectorStats(&s_sector_last);
   taskEXIT_CRITICAL();
@@ -448,6 +450,7 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
   s_last_path_validate_tick_ms = 0U;
   s_last_path_tx_valid = false;
   s_turn_settle_until_ms = 0U;
+  s_escape_replan_after_turn = false;
   SlamNav_ResetSectorStats(&s_sector_current);
   SlamNav_ResetSectorStats(&s_sector_last);
   taskEXIT_CRITICAL();
@@ -629,6 +632,14 @@ static void SlamNav_UpdateTurn(void)
     }
 
     s_turn_settle_until_ms = 0U;
+    if (s_escape_replan_after_turn)
+    {
+      s_escape_replan_after_turn = false;
+      s_state = SLAM_NAV_STATE_REPLAN;
+      s_state_enter_tick_ms = now;
+      SlamNav_SendStatus("REPLAN", "AFTER_ESCAPE");
+      return;
+    }
     s_state = SLAM_NAV_STATE_DRIVE;
     s_state_enter_tick_ms = now;
     return;
@@ -692,6 +703,51 @@ static void SlamNav_UpdateDrive(void)
     s_state_enter_tick_ms = now;
     SlamNav_SendStatus("REPLAN", "PATH_BLOCKED");
     return;
+  }
+
+  /* Front-block escape: lidar detects obstacle within safe distance while driving.
+     Stop, choose turn direction by sector openness (mirrors command-96 avoidance),
+     then replan after the turn completes. */
+  {
+    uint16_t front_mm;
+    uint16_t safe_mm;
+
+    taskENTER_CRITICAL();
+    front_mm = s_front_min_distance_mm;
+    safe_mm  = s_safe_distance_mm;
+    taskEXIT_CRITICAL();
+
+    if ((front_mm > 0U) && (front_mm < safe_mm))
+    {
+      SlamNavSectorStats_t sectors = SlamNav_GetSectorSnapshot(now);
+      int32_t escape_heading;
+
+      /* UINT16_MAX means the sector had no reading → treat as fully open (> safe_mm). */
+      bool right_open = (sectors.right_mm > safe_mm);
+      bool left_open  = (sectors.left_mm  > safe_mm);
+
+      if (right_open && (!left_open || (sectors.right_mm >= sectors.left_mm)))
+      {
+        escape_heading = SlamNav_NormalizeHeadingCdeg(pose.heading_cdeg - 9000L);
+      }
+      else if (left_open)
+      {
+        escape_heading = SlamNav_NormalizeHeadingCdeg(pose.heading_cdeg + 9000L);
+      }
+      else
+      {
+        escape_heading = SlamNav_NormalizeHeadingCdeg(pose.heading_cdeg + 18000L);
+      }
+
+      MotorControl_Stop();
+      s_target_heading_cdeg      = escape_heading;
+      s_escape_replan_after_turn = true;
+      s_state                    = SLAM_NAV_STATE_TURN;
+      s_state_enter_tick_ms      = now;
+      s_turn_settle_until_ms     = 0U;
+      SlamNav_SendStatus("ESCAPE", "FRONT_BLOCK");
+      return;
+    }
   }
 
   dx_mm = s_target_x_mm - pose.x_mm;
